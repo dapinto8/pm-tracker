@@ -33,9 +33,10 @@ export const ASSET_CONFIG: Record<Asset, AssetConfig> = {
 export const DISCOVERY_HOURS_AHEAD = 24;
 
 // Cron expressions
-export const CRON_FETCH = '*/10 * * * *';        // every 10 min
-export const CRON_DISCOVERY = '5 * * * *';       // every hour at :05
-export const CRON_OUTCOME_CHECK = '*/5 * * * *'; // every 5 min
+export const CRON_DISCOVERY = '5 * * * *';           // every hour at :05
+export const CRON_FETCH = '0-45/5 * * * *';          // every 5 min 
+export const CRON_LAST_MINUTE = '50-59 * * * *';     // minutes 50-59
+export const CRON_RESOLUTION_WATCH = '*/30 * * * *'; // every 30 min
 
 // Database
 export const DB_PATH = process.env.DB_PATH ?? './data/tracker.db';

@@ -1,14 +1,14 @@
-import { DB_PATH, CRON_FETCH, CRON_DISCOVERY, CRON_OUTCOME_CHECK } from './config.js';
+import { DB_PATH } from './config.js';
 import { StorageService } from './services/storage.js';
 import { PolymarketService } from './services/polymarket.js';
-import { MarketDiscoveryService } from './services/market-discovery.js';
+import { MarketService } from './services/market.js';
 import { Scheduler } from './services/scheduler.js';
 import { logger } from './utils/logger.js';
 
 const storage = new StorageService();
 const polymarket = new PolymarketService();
-const discovery = new MarketDiscoveryService(polymarket, storage);
-const scheduler = new Scheduler(polymarket, storage, discovery);
+const market = new MarketService(polymarket, storage);
+const scheduler = new Scheduler(market);
 
 function shutdown(): void {
   logger.info('Shutting down...');
@@ -24,15 +24,14 @@ process.on('SIGTERM', shutdown);
 async function main(): Promise<void> {
   logger.info('=== pm-tracker ===');
   logger.info(`DB: ${DB_PATH}`);
-  logger.info(`Cron: fetch=${CRON_FETCH}, discovery=${CRON_DISCOVERY}, outcome=${CRON_OUTCOME_CHECK}`);
 
   // Initial discovery
   logger.info('Running initial discovery...');
-  await discovery.discoverNewMarkets();
+  await market.discoverNewMarkets();
 
   // Initial fetch
   logger.info('Running initial fetch...');
-  await scheduler.runFetchJob();
+  await market.fetchActiveMarketSnapshots();
 
   // Start scheduler
   scheduler.start();

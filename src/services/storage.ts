@@ -183,6 +183,27 @@ export class StorageService {
     return rows.map((r) => this.rowToMarket(r));
   }
 
+  getClosingMarkets(withinMinutes: number = 5): HourlyMarket[] {
+    const sql = `
+      SELECT * FROM markets
+      WHERE outcome IS NULL
+        AND datetime(hour_end) > datetime('now')
+        AND datetime(hour_end) <= datetime('now', '+' || ? || ' minutes')
+    `;
+    const rows = this.stmt(sql).all(withinMinutes) as MarketRow[];
+    return rows.map((r) => this.rowToMarket(r));
+  }
+
+  getPendingResolutionMarkets(): HourlyMarket[] {
+    const sql = `
+      SELECT * FROM markets
+      WHERE outcome IS NULL
+        AND datetime(hour_end) <= datetime('now')
+    `;
+    const rows = this.stmt(sql).all() as MarketRow[];
+    return rows.map((r) => this.rowToMarket(r));
+  }
+
   updateMarketOutcome(id: string, outcome: 'UP' | 'DOWN'): void {
     const sql = `UPDATE markets SET outcome = ?, updated_at = ? WHERE id = ?`;
     this.stmt(sql).run(outcome, new Date().toISOString(), id);
