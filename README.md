@@ -160,13 +160,22 @@ drawdown, and the last 10 trades.
 Migrations are additive only — existing rows are never rewritten, so the
 historical hourly data stays intact and queryable alongside the 5m rows.
 
+One exception, and it is not a migration: `snapshots.up_price` / `down_price`
+are now **nullable**, because an empty side of the book has no price and a `0`
+sentinel is indistinguishable from a real one. SQLite cannot drop a `NOT NULL`
+in place, so there is no upgrade path — a database created before this change
+is rejected at startup with an explicit message, and the fix is to delete the
+file and let it be recreated. Nothing is deleted automatically.
+
 | Column | Notes |
 | --- | --- |
 | `markets.hour_start` / `hour_end` | Window start/end. Legacy names kept — renaming would be a destructive migration. Mapped to `windowStart` / `windowEnd` in code. |
 | `markets.duration_minutes` | `5` for the new series; `null` on pre-migration rows, which were all hourly. Use this to tell them apart. |
 | `snapshots.second_of_window` | Seconds since the window opened — the useful resolution here. `null` on pre-migration rows. |
 | `snapshots.minute_of_hour` | Whole minutes since the window opened (`0`–`4` for 5m markets). Kept for continuity. |
-| `snapshots.up_bid_size` / `up_ask_size` | Size resting at the top of book. `null` on pre-migration rows. |
+| `snapshots.up_bid_size` / `up_ask_size` | Size resting at the top of book. `null` on pre-migration rows, and `null` whenever that side of the book is empty. |
+| `snapshots.up_price` / `down_price` | Best bid on each side. Nullable: `null` means that side had no bid. |
+| `snapshots.up_bid` / `up_ask` / `spread` / `midpoint` | All nullable and all honest: `null` means no quote. `spread` and `midpoint` are only written when **both** sides are present (see below). |
 | `snapshots.volume_24h` | Gamma-only, so `null` on 5m rows (see snapshot cadence above). |
 | `trades.status` | `open`, `filled`, `cancelled`, `settled`, `failed`. |
 
@@ -178,3 +187,19 @@ Reading `bids[0]`/`asks[0]` yields the two extreme ends of the book — which is
 why snapshots taken before this fix stored `bid=0.01 / ask=0.99` and a midpoint
 of 0.50 for every row. Verified against `client.getMidpoint()` across live
 tokens: `(bids[-1] + asks[-1]) / 2` matches the API midpoint exactly.
+
+### Empty sides
+
+One side of the book routinely **empties out** in the final seconds of a window,
+once the outcome is near-certain and nobody is left quoting the loser. An empty
+side is `null`, never `0`:
+
+- `spread` and `midpoint` are computed **only when both sides are present**.
+  Averaging a real 0.99 ask against a missing bid coerced to 0 reported `0.495`
+  for a market that was actually at 0.99 — a plausible-looking number that was
+  pure fiction, and the reason this rule exists.
+- Persistence uses `??`, never `||`, so a legitimate `0` (a zero spread, a zero
+  resting size) is stored as `0` rather than being rewritten to `null`.
+
+The entry logic treats a one-sided book as a hard decline: no favorite can be
+established without both sides.

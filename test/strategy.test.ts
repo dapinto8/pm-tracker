@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   evaluateEntry,
+  midpointOf,
   roundShares,
   settlePnl,
   type EntryThresholds,
@@ -82,10 +83,57 @@ test('rejects when neither side is a favorite', () => {
   assert.ok(!d.enter && /no favorite/.test(d.reason));
 });
 
-test('rejects a one-sided book', () => {
-  const d = evaluateEntry({ up: { bid: 0, ask: 0.94, bidSize: 0, askSize: 500, spread: 0 }, down: DOG, stakeUsd: 100 }, THRESHOLDS);
+test('rejects a book with an empty bid side (null)', () => {
+  // What the final seconds of a window actually look like: nobody left bidding
+  // the favorite, so bid/bidSize/spread are all null.
+  const up: BookTop = { bid: null, ask: 0.94, bidSize: null, askSize: 500, spread: null };
+  const d = evaluateEntry({ up, down: DOG, stakeUsd: 100 }, THRESHOLDS);
+  assert.equal(d.enter, false);
+  assert.ok(!d.enter && /up book is one-sided or empty/.test(d.reason));
+});
+
+test('rejects a book with an empty ask side (null)', () => {
+  // No ask means nothing to buy, whatever the bid implies about the favorite.
+  const up: BookTop = { bid: 0.93, ask: null, bidSize: 500, askSize: null, spread: null };
+  const d = evaluateEntry({ up, down: DOG, stakeUsd: 100 }, THRESHOLDS);
+  assert.equal(d.enter, false);
+  assert.ok(!d.enter && /up book is one-sided or empty/.test(d.reason));
+});
+
+test('rejects when the DOG side is one-sided, even if the favorite looks fine', () => {
+  const down: BookTop = { bid: null, ask: null, bidSize: null, askSize: null, spread: null };
+  const d = evaluateEntry({ up: book(0.93, 0.94), down, stakeUsd: 100 }, THRESHOLDS);
+  assert.equal(d.enter, false);
+  assert.ok(!d.enter && /down book is one-sided or empty/.test(d.reason));
+});
+
+test('rejects a fully empty book on both sides', () => {
+  const empty: BookTop = { bid: null, ask: null, bidSize: null, askSize: null, spread: null };
+  const d = evaluateEntry({ up: empty, down: empty, stakeUsd: 100 }, THRESHOLDS);
+  assert.equal(d.enter, false);
+  assert.ok(!d.enter && /one-sided or empty/.test(d.reason));
+});
+
+test('still rejects a legacy zero-price book', () => {
+  // Pre-fix callers represented an absent side as 0; that must keep being
+  // rejected rather than read as a real quote.
+  const up: BookTop = { bid: 0, ask: 0.94, bidSize: 0, askSize: 500, spread: 0 };
+  const d = evaluateEntry({ up, down: DOG, stakeUsd: 100 }, THRESHOLDS);
   assert.equal(d.enter, false);
   assert.ok(!d.enter && /one-sided/.test(d.reason));
+});
+
+test('rejects when the ask size is unknown', () => {
+  const up: BookTop = { bid: 0.93, ask: 0.94, bidSize: 100, askSize: null, spread: 0.01 };
+  const d = evaluateEntry({ up, down: DOG, stakeUsd: 100 }, THRESHOLDS);
+  assert.equal(d.enter, false);
+  assert.ok(!d.enter && /ask size/.test(d.reason));
+});
+
+test('midpointOf is null when a side is missing, and exact when both are present', () => {
+  assert.equal(midpointOf({ bid: null, ask: 0.99, bidSize: null, askSize: 5, spread: null }), null);
+  assert.equal(midpointOf({ bid: 0.99, ask: null, bidSize: 5, askSize: null, spread: null }), null);
+  assert.equal(midpointOf(book(0.93, 0.95)), 0.94);
 });
 
 test('roundShares always rounds down', () => {

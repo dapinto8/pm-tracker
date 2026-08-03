@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import { ASSETS, ASSET_CONFIG, DISCOVERY_WINDOWS_AHEAD, WINDOW_MINUTES } from '../config.js';
-import type { TrackedMarket, GammaMarket, Asset, Snapshot } from '../models/types.js';
+import type { TrackedMarket, GammaMarket, Asset, Snapshot, BookTop } from '../models/types.js';
 import type { PolymarketService } from './polymarket.js';
 import type { StorageService } from './storage.js';
 import type { TradingService } from './trading.js';
@@ -131,12 +131,25 @@ export class MarketService {
       const elapsedMs = now.getTime() - new Date(market.eventStartTime).getTime();
       const secondOfWindow = Math.floor(elapsedMs / 1000);
 
+      // A one-sided book is normal near the close, once the outcome is settled
+      // enough that nobody quotes the losing side. Record it as absent rather
+      // than inventing a price: a midpoint computed against a missing side is
+      // worse than no midpoint at all.
+      const oneSided = [up, down].some((b) => b.bid === null || b.ask === null);
+      if (oneSided) {
+        logger.debug(
+          `Fetch: ${market.slug} one-sided book at t+${secondOfWindow}s ` +
+          `(up ${fmtBook(up)}, down ${fmtBook(down)})`
+        );
+      }
+
       rows.push({
         marketId: market.id,
         fetchedAt,
         minuteOfHour: Math.floor(elapsedMs / 60000),
         secondOfWindow,
         // Matches the previous getPrices(side=BUY) semantics: the best bid.
+        // Null when that side has no bid at all.
         upPrice: up.bid,
         downPrice: down.bid,
         upBid: up.bid,
@@ -144,7 +157,7 @@ export class MarketService {
         upBidSize: up.bidSize,
         upAskSize: up.askSize,
         spread: up.spread,
-        midpoint: (up.bid + up.ask) / 2,
+        midpoint: up.bid !== null && up.ask !== null ? (up.bid + up.ask) / 2 : null,
         lastTradePrice: lastTrades.get(market.tokenIdUp) ?? null,
         volume24h: null,
       });
@@ -177,7 +190,14 @@ export class MarketService {
         if (outcome) {
           this.storage.updateMarketOutcome(market.id, outcome);
           resolved++;
-          logger.info(`Resolution: ${market.slug} -> ${outcome}`);
+          // Log the raw Gamma fields the outcome was derived from, so a
+          // recorded outcome can later be audited against the final book
+          // rather than taken on trust.
+          logger.info(
+            `Resolution: ${market.slug} -> ${outcome} ` +
+            `[outcomes=${gm.outcomes} outcomePrices=${gm.outcomePrices} ` +
+            `conditionId=${gm.conditionId}]`
+          );
 
           // Settle any positions on this market. Isolated so a settlement
           // failure never stops the resolution watcher.
@@ -217,6 +237,13 @@ export class MarketService {
     return null;
   }
 
+  /**
+   * Read the winner off Gamma's settled outcome prices.
+   *
+   * Returns null when neither side is decisive, which is normal for a market
+   * that has closed but not yet settled. The raw fields are logged either way
+   * so a recorded outcome is auditable after the fact.
+   */
   private determineOutcome(gm: GammaMarket): 'UP' | 'DOWN' | null {
     try {
       const prices = JSON.parse(gm.outcomePrices) as string[];
@@ -224,9 +251,22 @@ export class MarketService {
       const downPrice = parseFloat(prices[1]);
       if (upPrice > 0.9) return 'UP';
       if (downPrice > 0.9) return 'DOWN';
+      logger.info(
+        `Resolution: ${gm.slug} closed but undecided ` +
+        `[outcomes=${gm.outcomes} outcomePrices=${gm.outcomePrices}]`
+      );
     } catch {
-      logger.error(`Resolution: ${gm.slug} failed to determine outcome`);
+      logger.error(
+        `Resolution: ${gm.slug} failed to determine outcome ` +
+        `[outcomes=${gm.outcomes} outcomePrices=${gm.outcomePrices}]`
+      );
     }
     return null;
   }
+}
+
+/** Compact book rendering for logs; `-` marks an empty side. */
+function fmtBook(book: BookTop): string {
+  const px = (n: number | null) => (n === null ? '-' : n.toFixed(4));
+  return `${px(book.bid)}/${px(book.ask)}`;
 }

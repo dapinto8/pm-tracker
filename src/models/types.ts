@@ -46,8 +46,13 @@ export interface Snapshot {
   minuteOfHour: number;
   /** Seconds since the window opened - the useful resolution for 5m markets. */
   secondOfWindow: number | null;
-  upPrice: number;
-  downPrice: number;
+  /**
+   * Best bid on each side, or null when that side of the book is empty.
+   * Null is the only representation of "no quote" - never 0, which would be
+   * indistinguishable from a real price.
+   */
+  upPrice: number | null;
+  downPrice: number | null;
   upBid: number | null;
   upAsk: number | null;
   upBidSize: number | null;
@@ -60,15 +65,23 @@ export interface Snapshot {
 
 /**
  * Top of the order book for a single token.
+ *
  * Polymarket's CLOB returns bids sorted ascending and asks sorted descending,
  * so the best quotes are the LAST elements of each array.
+ *
+ * Every field is nullable because a side of the book can be genuinely EMPTY -
+ * common in the final seconds of a window once the outcome is near-certain and
+ * nobody is left quoting the losing side. Null means "no quote on that side";
+ * it must never be conflated with a price of 0, which is a real (if unlikely)
+ * quote. `spread` is null unless BOTH sides are present, so an absent side can
+ * never masquerade as a tight book.
  */
 export interface BookTop {
-  bid: number;
-  ask: number;
-  bidSize: number;
-  askSize: number;
-  spread: number;
+  bid: number | null;
+  ask: number | null;
+  bidSize: number | null;
+  askSize: number | null;
+  spread: number | null;
 }
 
 export interface GammaMarket {

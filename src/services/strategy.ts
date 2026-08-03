@@ -64,8 +64,31 @@ export type EntryDecision =
   | { enter: true; plan: EntryPlan }
   | { enter: false; reason: string };
 
-export function midpointOf(book: BookTop): number {
+/** Midpoint, or null if either side of the book is empty. */
+export function midpointOf(book: BookTop): number | null {
+  if (book.bid === null || book.ask === null) return null;
   return (book.bid + book.ask) / 2;
+}
+
+/** A book with both sides quoted - what every check below assumes. */
+interface TwoSidedBook {
+  bid: number;
+  ask: number;
+  askSize: number | null;
+  spread: number;
+}
+
+/**
+ * Narrow a book to one with both sides present, or null if it is one-sided.
+ *
+ * Null and 0 are both treated as "no quote": null is an empty side, and a
+ * resting order at 0 does not exist on this venue. Rejecting both keeps the
+ * behaviour identical to the pre-nullable version, which only ever saw 0.
+ */
+function twoSided(book: BookTop): TwoSidedBook | null {
+  const { bid, ask } = book;
+  if (bid === null || ask === null || bid <= 0 || ask <= 0) return null;
+  return { bid, ask, askSize: book.askSize, spread: book.spread ?? ask - bid };
 }
 
 /** Round down so we never try to take more than what rests at the top of book. */
@@ -88,14 +111,17 @@ export function evaluateEntry(
     return { enter: false, reason: `stake must be positive (got ${stakeUsd})` };
   }
 
-  for (const [label, book] of [['up', up], ['down', down]] as const) {
-    if (book.bid <= 0 || book.ask <= 0) {
-      return { enter: false, reason: `${label} book is one-sided or empty` };
-    }
+  const upBook = twoSided(up);
+  if (!upBook) {
+    return { enter: false, reason: `up book is one-sided or empty` };
+  }
+  const downBook = twoSided(down);
+  if (!downBook) {
+    return { enter: false, reason: `down book is one-sided or empty` };
   }
 
-  const upMid = midpointOf(up);
-  const downMid = midpointOf(down);
+  const upMid = (upBook.bid + upBook.ask) / 2;
+  const downMid = (downBook.bid + downBook.ask) / 2;
 
   // Favorite = the side whose midpoint is at or above 0.5. If a crossed or
   // stale book puts both above 0.5, take the higher one.
@@ -113,7 +139,7 @@ export function evaluateEntry(
     };
   }
 
-  const book = side === 'UP' ? up : down;
+  const book = side === 'UP' ? upBook : downBook;
   const entryPrice = book.ask;
 
   if (entryPrice < thresholds.minAsk || entryPrice >= thresholds.maxAsk) {
@@ -135,10 +161,10 @@ export function evaluateEntry(
     return { enter: false, reason: `computed share size rounds to zero` };
   }
 
-  if (book.askSize < shares) {
+  if (book.askSize === null || book.askSize < shares) {
     return {
       enter: false,
-      reason: `${side} ask size ${book.askSize} < required ${shares} shares`,
+      reason: `${side} ask size ${book.askSize ?? 'unknown'} < required ${shares} shares`,
     };
   }
 

@@ -13,6 +13,39 @@ import { logger } from '../utils/logger.js';
 
 // v2 schema - Up/Down markets without target_price
 
+/**
+ * Column list for `snapshots`, shared by the fresh-create path and the rebuild
+ * migration so the two can never drift apart.
+ *
+ * up_price/down_price are NULLABLE: a side of the book can be genuinely empty,
+ * and there is no in-band value that means "no quote". An earlier revision had
+ * them NOT NULL, which forced a 0 sentinel that was indistinguishable from a
+ * real price.
+ */
+const SNAPSHOT_COLUMNS_DDL = `
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  market_id TEXT NOT NULL REFERENCES markets(id),
+  fetched_at TEXT NOT NULL,
+  minute_of_hour INTEGER NOT NULL,
+  second_of_window INTEGER,
+  up_price REAL,
+  down_price REAL,
+  up_bid REAL,
+  up_ask REAL,
+  up_bid_size REAL,
+  up_ask_size REAL,
+  spread REAL,
+  midpoint REAL,
+  last_trade_price REAL,
+  volume_24h REAL
+`;
+
+const SNAPSHOT_INDEXES_DDL = `
+  CREATE INDEX IF NOT EXISTS idx_snapshots_market_id ON snapshots(market_id);
+  CREATE INDEX IF NOT EXISTS idx_snapshots_minute ON snapshots(minute_of_hour);
+  CREATE INDEX IF NOT EXISTS idx_snapshots_fetched ON snapshots(fetched_at);
+`;
+
 interface MarketRow {
   id: string;
   condition_id: string;
@@ -37,8 +70,8 @@ interface SnapshotRow {
   fetched_at: string;
   minute_of_hour: number;
   second_of_window: number | null;
-  up_price: number;
-  down_price: number;
+  up_price: number | null;
+  down_price: number | null;
   up_bid: number | null;
   up_ask: number | null;
   up_bid_size: number | null;
@@ -70,9 +103,11 @@ interface TradeRow {
 
 export class StorageService {
   private db: Database.Database;
+  private dbPath: string;
   private stmtCache: Map<string, Database.Statement> = new Map();
 
   constructor(dbPath: string = DB_PATH) {
+    this.dbPath = dbPath;
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
     this.initTables();
@@ -99,23 +134,7 @@ export class StorageService {
         updated_at TEXT NOT NULL
       );
 
-      CREATE TABLE IF NOT EXISTS snapshots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        market_id TEXT NOT NULL REFERENCES markets(id),
-        fetched_at TEXT NOT NULL,
-        minute_of_hour INTEGER NOT NULL,
-        second_of_window INTEGER,
-        up_price REAL NOT NULL,
-        down_price REAL NOT NULL,
-        up_bid REAL,
-        up_ask REAL,
-        up_bid_size REAL,
-        up_ask_size REAL,
-        spread REAL,
-        midpoint REAL,
-        last_trade_price REAL,
-        volume_24h REAL
-      );
+      CREATE TABLE IF NOT EXISTS snapshots (${SNAPSHOT_COLUMNS_DDL});
 
       CREATE TABLE IF NOT EXISTS trades (
         id TEXT PRIMARY KEY,
@@ -136,9 +155,7 @@ export class StorageService {
         status TEXT NOT NULL
       );
 
-      CREATE INDEX IF NOT EXISTS idx_snapshots_market_id ON snapshots(market_id);
-      CREATE INDEX IF NOT EXISTS idx_snapshots_minute ON snapshots(minute_of_hour);
-      CREATE INDEX IF NOT EXISTS idx_snapshots_fetched ON snapshots(fetched_at);
+      ${SNAPSHOT_INDEXES_DDL}
       CREATE INDEX IF NOT EXISTS idx_markets_asset ON markets(asset);
       CREATE INDEX IF NOT EXISTS idx_markets_event_start ON markets(event_start_time);
       CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id);
@@ -162,6 +179,37 @@ export class StorageService {
     this.addColumnIfMissing('markets', 'duration_minutes', 'INTEGER');
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_markets_hour_end ON markets(hour_end)`
+    );
+    this.assertNullablePrices();
+  }
+
+  /**
+   * Fail fast on a database created before up_price/down_price were nullable.
+   *
+   * There is no migration for this: SQLite cannot relax a NOT NULL in place,
+   * and the decision was to start fresh rather than rebuild the table. Without
+   * this check the mismatch would surface as a SQLITE_CONSTRAINT_NOTNULL only
+   * once a book happened to go one-sided - intermittent, mid-run, and hours
+   * after startup.
+   */
+  private assertNullablePrices(): void {
+    const cols = this.db.prepare(`PRAGMA table_info(snapshots)`).all() as {
+      name: string;
+      notnull: number;
+    }[];
+    const legacy = cols.filter(
+      (c) => (c.name === 'up_price' || c.name === 'down_price') && c.notnull === 1
+    );
+    if (legacy.length === 0) return;
+
+    // Release the handle before bailing out - this throws from the constructor,
+    // so nobody is left with an object to call close() on.
+    this.db.close();
+    throw new Error(
+      `Database at ${this.dbPath} predates nullable prices ` +
+      `(${legacy.map((c) => c.name).join(', ')} still NOT NULL). ` +
+      `An empty side of the book cannot be recorded against this schema. ` +
+      `Delete or move the file and let it be recreated.`
     );
   }
 
@@ -329,21 +377,25 @@ export class StorageService {
       )
     `;
 
+    // `??`, never `||`: a legitimate 0 (a zero spread, a genuinely empty size)
+    // must survive. `||` used to rewrite every one of those to null while
+    // leaving derived values like midpoint intact, which is how corrupt rows
+    // ended up looking self-consistent.
     this.stmt(sql).run({
       marketId: snapshot.marketId,
       fetchedAt: snapshot.fetchedAt,
       minuteOfHour: snapshot.minuteOfHour,
       secondOfWindow: snapshot.secondOfWindow ?? null,
-      upPrice: snapshot.upPrice || 0,
-      downPrice: snapshot.downPrice || 0,
-      upBid: snapshot.upBid || null,
-      upAsk: snapshot.upAsk || null,
-      upBidSize: snapshot.upBidSize || null,
-      upAskSize: snapshot.upAskSize || null,
-      spread: snapshot.spread || null,
-      midpoint: snapshot.midpoint || null,
-      lastTradePrice: snapshot.lastTradePrice || null,
-      volume24h: snapshot.volume24h || null,
+      upPrice: snapshot.upPrice ?? null,
+      downPrice: snapshot.downPrice ?? null,
+      upBid: snapshot.upBid ?? null,
+      upAsk: snapshot.upAsk ?? null,
+      upBidSize: snapshot.upBidSize ?? null,
+      upAskSize: snapshot.upAskSize ?? null,
+      spread: snapshot.spread ?? null,
+      midpoint: snapshot.midpoint ?? null,
+      lastTradePrice: snapshot.lastTradePrice ?? null,
+      volume24h: snapshot.volume24h ?? null,
     });
   }
 

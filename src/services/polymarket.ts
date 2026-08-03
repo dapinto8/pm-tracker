@@ -22,12 +22,19 @@ type PricesResponse = {
   [tokenId: string]: TokenPrices;
 };
 
-interface OrderBookSummary {
+export interface OrderBookSummary {
   market: string;
   asset_id: string;
   timestamp: string;
   bids: { price: string; size: string }[];
   asks: { price: string; size: string }[];
+}
+
+/** parseFloat, but a missing or unparseable value is null rather than NaN. */
+function numOrNull(value: string | undefined): number | null {
+  if (value === undefined || value === null) return null;
+  const n = parseFloat(value);
+  return Number.isFinite(n) ? n : null;
 }
 
 /**
@@ -37,21 +44,30 @@ interface OrderBookSummary {
  * so the best quotes are the LAST elements of each array. Verified empirically
  * against client.getMidpoint(): (bids[-1] + asks[-1]) / 2 matches the API
  * midpoint exactly, while (bids[0] + asks[0]) / 2 always yields ~0.50.
+ *
+ * An EMPTY side yields null, never 0. This matters: in the final seconds of a
+ * window one side routinely empties out, and returning 0 for it made a market
+ * really trading at 0.99 look like 0.495 once averaged into a midpoint. Null
+ * propagates instead - `spread` is only computed when both sides are present,
+ * and callers must decide explicitly what an absent side means.
  */
-function bookTopOf(book: OrderBookSummary): BookTop {
+export function bookTopOf(book: OrderBookSummary): BookTop {
   const bids = book.bids || [];
   const asks = book.asks || [];
 
   const bestBidLevel = bids.length > 0 ? bids[bids.length - 1] : null;
   const bestAskLevel = asks.length > 0 ? asks[asks.length - 1] : null;
 
-  const bid = bestBidLevel ? parseFloat(bestBidLevel.price) : 0;
-  const ask = bestAskLevel ? parseFloat(bestAskLevel.price) : 0;
-  const bidSize = bestBidLevel ? parseFloat(bestBidLevel.size) : 0;
-  const askSize = bestAskLevel ? parseFloat(bestAskLevel.size) : 0;
-  const spread = ask > 0 && bid > 0 ? ask - bid : 0;
+  const bid = bestBidLevel ? numOrNull(bestBidLevel.price) : null;
+  const ask = bestAskLevel ? numOrNull(bestAskLevel.price) : null;
 
-  return { bid, ask, bidSize, askSize, spread };
+  return {
+    bid,
+    ask,
+    bidSize: bestBidLevel ? numOrNull(bestBidLevel.size) : null,
+    askSize: bestAskLevel ? numOrNull(bestAskLevel.size) : null,
+    spread: bid !== null && ask !== null ? ask - bid : null,
+  };
 }
 
 export class PolymarketService {
