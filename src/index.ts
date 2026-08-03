@@ -50,6 +50,14 @@ async function main(): Promise<void> {
     logger.info('Trading: off');
   }
 
+  // Before anything else can place a new order: resolve any live trade left
+  // open by a previous run. A no-op unless mode is live and such trades exist.
+  try {
+    await trading.reconcileOpenTrades();
+  } catch (err) {
+    logger.error(`Reconcile: failed: ${err}`);
+  }
+
   // Initial discovery
   logger.info('Running initial discovery...');
   await market.discoverNewMarkets();

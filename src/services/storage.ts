@@ -302,6 +302,12 @@ export class StorageService {
     return row ? this.rowToMarket(row) : null;
   }
 
+  getMarketById(id: string): TrackedMarket | null {
+    const sql = `SELECT * FROM markets WHERE id = ?`;
+    const row = this.stmt(sql).get(id) as MarketRow | undefined;
+    return row ? this.rowToMarket(row) : null;
+  }
+
   getMarketBySlug(slug: string): TrackedMarket | null {
     const sql = `SELECT * FROM markets WHERE slug = ?`;
     const row = this.stmt(sql).get(slug) as MarketRow | undefined;
@@ -450,15 +456,31 @@ export class StorageService {
     this.stmt(sql).run(trade);
   }
 
+  /**
+   * Record what an order actually did.
+   *
+   * `shares`/`stakeUsd` are updatable because a partial fill acquires less than
+   * was planned, and settlement pays out on the stored share count - leave it
+   * at the intended size and the pnl is wrong by the unfilled remainder.
+   * Every field is COALESCE'd, so omitting one leaves it as-is.
+   */
   updateTradeExecution(
     id: string,
-    fields: { status: TradeStatus; orderId?: string | null; fillPrice?: number | null }
+    fields: {
+      status: TradeStatus;
+      orderId?: string | null;
+      fillPrice?: number | null;
+      shares?: number | null;
+      stakeUsd?: number | null;
+    }
   ): void {
     const sql = `
       UPDATE trades
       SET status = @status,
           order_id = COALESCE(@orderId, order_id),
-          fill_price = COALESCE(@fillPrice, fill_price)
+          fill_price = COALESCE(@fillPrice, fill_price),
+          shares = COALESCE(@shares, shares),
+          stake_usd = COALESCE(@stakeUsd, stake_usd)
       WHERE id = @id
     `;
     this.stmt(sql).run({
@@ -466,6 +488,8 @@ export class StorageService {
       status: fields.status,
       orderId: fields.orderId ?? null,
       fillPrice: fields.fillPrice ?? null,
+      shares: fields.shares ?? null,
+      stakeUsd: fields.stakeUsd ?? null,
     });
   }
 
@@ -492,14 +516,49 @@ export class StorageService {
     return rows.map((r) => this.rowToTrade(r));
   }
 
-  /** Count of entries that took (or are taking) risk on the given UTC day. */
+  /**
+   * Count of entries that took (or are taking) risk on the given UTC day.
+   *
+   * Only `open`, `filled` and `settled` count. A `cancelled` order never
+   * acquired a position, and on a 15-second entry cadence a run of unfilled
+   * orders would otherwise burn the whole daily cap without risking a cent.
+   * `failed` never reached the exchange at all.
+   */
   countTradesOnDay(mode: string, utcDay: string): number {
     const sql = `
       SELECT COUNT(*) AS n FROM trades
-      WHERE mode = ? AND date(entered_at) = ? AND status != 'failed'
+      WHERE mode = ? AND date(entered_at) = ?
+        AND status IN ('open', 'filled', 'settled')
     `;
     const row = this.stmt(sql).get(mode, utcDay) as { n: number };
     return row.n;
+  }
+
+  /**
+   * Money currently at risk: cost of every position not yet settled.
+   *
+   * Uses the actual fill price where known, falling back to the intended entry
+   * price for orders still working. This is the amount that goes to zero if
+   * every open position resolves against us.
+   */
+  getOpenExposure(mode: string): number {
+    const sql = `
+      SELECT COALESCE(SUM(shares * COALESCE(fill_price, entry_price)), 0) AS total
+      FROM trades
+      WHERE mode = ? AND status IN ('open', 'filled')
+    `;
+    const row = this.stmt(sql).get(mode) as { total: number };
+    return row.total;
+  }
+
+  /**
+   * Live trades left `open` - an order was posted but its outcome was never
+   * recorded, so the process died mid-flight. See TradingService.reconcileOpenTrades.
+   */
+  getOpenLiveTrades(): Trade[] {
+    const sql = `SELECT * FROM trades WHERE mode = 'live' AND status = 'open' ORDER BY entered_at`;
+    const rows = this.stmt(sql).all() as TradeRow[];
+    return rows.map((r) => this.rowToTrade(r));
   }
 
   /** Realized pnl for trades settled on the given UTC day. */

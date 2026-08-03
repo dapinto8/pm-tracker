@@ -185,3 +185,61 @@ export function evaluateEntry(
 export function settlePnl(shares: number, entryPrice: number, won: boolean): number {
   return won ? shares * (1 - entryPrice) : -shares * entryPrice;
 }
+
+export interface FillOutcome {
+  status: 'filled' | 'cancelled';
+  /** Shares actually acquired. 0 when nothing matched. */
+  shares: number;
+  /** What those shares actually cost. */
+  stakeUsd: number;
+  /** True when only part of the intended size was acquired. */
+  partial: boolean;
+}
+
+/**
+ * Turn "how much of the order matched" into the position we actually hold.
+ *
+ * A PARTIAL match is a real position holding real money. Treating it as a
+ * cancel - which is what happens if you only accept `matched >= plan.shares` -
+ * leaves an unsettled position on the exchange that the trades table never
+ * knows about. So anything above zero is recorded as `filled`, sized to what
+ * actually matched.
+ *
+ * A full fill keeps the plan's numbers untouched; only a partial recomputes,
+ * because only then do shares and stake differ from what was intended.
+ */
+export function resolveFill(
+  plan: EntryPlan,
+  matchedShares: number,
+  fillPrice: number | null
+): FillOutcome {
+  const matched = Number.isFinite(matchedShares) && matchedShares > 0 ? matchedShares : 0;
+
+  if (matched <= 0) {
+    return { status: 'cancelled', shares: 0, stakeUsd: 0, partial: false };
+  }
+  if (matched >= plan.shares) {
+    return { status: 'filled', shares: plan.shares, stakeUsd: plan.stakeUsd, partial: false };
+  }
+
+  // Price actually paid, falling back to the limit price we posted at - a GTC
+  // buy can only fill at or below it, so this is a conservative cost estimate.
+  const price = fillPrice ?? plan.entryPrice;
+  return { status: 'filled', shares: matched, stakeUsd: matched * price, partial: true };
+}
+
+/**
+ * Whether the daily loss limit is breached, counting money still at risk.
+ *
+ * Realized pnl alone understates the worst case: with all three assets closing
+ * on the same 5-minute boundaries, several stakes can be in flight and
+ * unsettled when this is checked. Every open position is treated as a total
+ * loss, which is exactly what it is if the market resolves against us.
+ */
+export function isLossLimitBreached(
+  realizedPnl: number,
+  openExposureUsd: number,
+  limitUsd: number
+): boolean {
+  return realizedPnl - openExposureUsd <= -limitUsd;
+}
