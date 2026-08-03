@@ -1,14 +1,24 @@
-import { DB_PATH } from './config.js';
+import {
+  DB_PATH,
+  TRADING_MODE,
+  KILL_SWITCH,
+  STAKE_USD,
+  WINDOW_MINUTES,
+  SNAPSHOT_INTERVAL_SECONDS,
+  ASSETS,
+} from './config.js';
 import { StorageService } from './services/storage.js';
 import { PolymarketService } from './services/polymarket.js';
 import { MarketService } from './services/market.js';
+import { TradingService } from './services/trading.js';
 import { Scheduler } from './services/scheduler.js';
 import { logger } from './utils/logger.js';
 
 const storage = new StorageService();
 const polymarket = new PolymarketService();
-const market = new MarketService(polymarket, storage);
-const scheduler = new Scheduler(market);
+const trading = new TradingService(polymarket, storage);
+const market = new MarketService(polymarket, storage, trading);
+const scheduler = new Scheduler(market, trading);
 
 function shutdown(): void {
   logger.info('Shutting down...');
@@ -24,6 +34,21 @@ process.on('SIGTERM', shutdown);
 async function main(): Promise<void> {
   logger.info('=== pm-tracker ===');
   logger.info(`DB: ${DB_PATH}`);
+  logger.info(
+    `Tracking ${ASSETS.join('/')} ${WINDOW_MINUTES}m markets, ` +
+    `snapshot every ${SNAPSHOT_INTERVAL_SECONDS}s ` +
+    `(~${Math.floor((WINDOW_MINUTES * 60) / SNAPSHOT_INTERVAL_SECONDS)} per window)`
+  );
+
+  if (KILL_SWITCH) {
+    logger.warn('Trading: KILL_SWITCH set - trading disabled regardless of mode');
+  } else if (TRADING_MODE === 'live') {
+    logger.warn(`!!! Trading: LIVE MODE - real orders, real funds, $${STAKE_USD} per trade !!!`);
+  } else if (TRADING_MODE === 'paper') {
+    logger.info(`Trading: paper mode, $${STAKE_USD} simulated stake per trade`);
+  } else {
+    logger.info('Trading: off');
+  }
 
   // Initial discovery
   logger.info('Running initial discovery...');

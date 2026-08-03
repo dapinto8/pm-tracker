@@ -1,21 +1,23 @@
 import { v4 as uuidv4 } from 'uuid';
-import { ASSETS, ASSET_CONFIG } from '../config.js';
-import type { HourlyMarket, GammaMarket, Asset } from '../models/types.js';
+import { ASSETS, ASSET_CONFIG, DISCOVERY_WINDOWS_AHEAD, WINDOW_MINUTES } from '../config.js';
+import type { TrackedMarket, GammaMarket, Asset, Snapshot } from '../models/types.js';
 import type { PolymarketService } from './polymarket.js';
 import type { StorageService } from './storage.js';
+import type { TradingService } from './trading.js';
 import { logger } from '../utils/logger.js';
 import { generateUpcomingMarketSlugs } from '../utils/slug.js';
 
 export class MarketService {
   constructor(
     private polymarket: PolymarketService,
-    private storage: StorageService
+    private storage: StorageService,
+    private trading?: TradingService
   ) { }
 
   // === Discovery ===
 
-  async discoverNewMarkets(): Promise<HourlyMarket[]> {
-    const allNewMarkets: HourlyMarket[] = [];
+  async discoverNewMarkets(): Promise<TrackedMarket[]> {
+    const allNewMarkets: TrackedMarket[] = [];
 
     for (const asset of ASSETS) {
       const newMarkets = await this.discoverMarketsForAsset(asset);
@@ -26,11 +28,11 @@ export class MarketService {
     return allNewMarkets;
   }
 
-  async discoverMarketsForAsset(asset: Asset): Promise<HourlyMarket[]> {
-    logger.info(`Discovery: checking ${asset}`);
+  async discoverMarketsForAsset(asset: Asset): Promise<TrackedMarket[]> {
+    logger.debug(`Discovery: checking ${asset}`);
     const config = ASSET_CONFIG[asset];
-    const slugs = generateUpcomingMarketSlugs(config.slugPrefix, 2);
-    const newMarkets: HourlyMarket[] = [];
+    const slugs = generateUpcomingMarketSlugs(config.slugPrefix, DISCOVERY_WINDOWS_AHEAD);
+    const newMarkets: TrackedMarket[] = [];
 
     for (const slug of slugs) {
       try {
@@ -53,16 +55,19 @@ export class MarketService {
         }
 
         const now = new Date().toISOString();
-        const market: HourlyMarket = {
+        const market: TrackedMarket = {
           id: uuidv4(),
           conditionId: gm.conditionId,
           tokenIdUp: tokenIds.up,
           tokenIdDown: tokenIds.down,
           asset,
           question: gm.question,
+          // Gamma's startDate is the row's creation time (often a day early);
+          // eventStartTime is the actual window open.
           eventStartTime: gm.eventStartTime,
-          hourStart: gm.eventStartTime,
-          hourEnd: gm.endDate,
+          windowStart: gm.eventStartTime,
+          windowEnd: gm.endDate,
+          durationMinutes: WINDOW_MINUTES,
           outcome: null,
           slug: gm.slug,
           seriesSlug: gm.seriesSlug,
@@ -86,92 +91,69 @@ export class MarketService {
 
   // === Snapshot Fetching ===
 
+  /**
+   * Snapshot every active market.
+   *
+   * Runs on a seconds-level cadence, so it is built around batch endpoints:
+   * exactly TWO upstream calls per tick (order books + last trade prices)
+   * regardless of how many markets are active.
+   *
+   * Deliberately does NOT call Gamma per snapshot. Gamma lags badly at this
+   * timescale - observed reporting 0.505/0.50 for a market whose real book was
+   * 0.27/0.28 - so prices come from the CLOB only. That drops `volume24h`
+   * (Gamma-only), which is now null on 5m rows.
+   */
   async fetchActiveMarketSnapshots(): Promise<void> {
     const markets = this.storage.getActiveMarkets();
     if (markets.length === 0) {
-      logger.info('Fetch: no active markets');
+      logger.debug('Fetch: no active markets');
       return;
     }
 
+    const tokenIds = markets.flatMap((m) => [m.tokenIdUp, m.tokenIdDown]);
+    const [books, lastTrades] = await Promise.all([
+      this.polymarket.getBookTops(tokenIds),
+      this.polymarket.getLastTradePrices(tokenIds),
+    ]);
+
     const now = new Date();
     const fetchedAt = now.toISOString();
-    let saved = 0;
+    const rows: Omit<Snapshot, 'id'>[] = [];
 
     for (const market of markets) {
-      const marketStart = new Date(market.eventStartTime);
-      const minuteOfHour = Math.floor((now.getTime() - marketStart.getTime()) / 60000);
+      const up = books.get(market.tokenIdUp);
+      const down = books.get(market.tokenIdDown);
+      if (!up || !down) {
+        logger.warn(`Fetch: ${market.slug} missing book data, skipping`);
+        continue;
+      }
 
-      const [prices, midpoint, spreadData, gm] = await Promise.all([
-        this.polymarket.getPrices([market.tokenIdUp, market.tokenIdDown]),
-        this.polymarket.getMidpoint(market.tokenIdUp),
-        this.polymarket.getSpread(market.tokenIdUp),
-        this.polymarket.getMarketBySlug(market.slug),
-      ]);
+      const elapsedMs = now.getTime() - new Date(market.eventStartTime).getTime();
+      const secondOfWindow = Math.floor(elapsedMs / 1000);
 
-      const upPrice = prices.get(market.tokenIdUp) ?? 0;
-      const downPrice = prices.get(market.tokenIdDown) ?? 0;
-
-      this.storage.insertSnapshot({
+      rows.push({
         marketId: market.id,
         fetchedAt,
-        minuteOfHour,
-        upPrice,
-        downPrice,
-        upBid: spreadData?.bid ?? null,
-        upAsk: spreadData?.ask ?? null,
-        spread: spreadData?.spread ?? null,
-        midpoint: midpoint ?? null,
-        lastTradePrice: gm?.lastTradePrice ?? null,
-        volume24h: gm?.volume24hr ?? null,
+        minuteOfHour: Math.floor(elapsedMs / 60000),
+        secondOfWindow,
+        // Matches the previous getPrices(side=BUY) semantics: the best bid.
+        upPrice: up.bid,
+        downPrice: down.bid,
+        upBid: up.bid,
+        upAsk: up.ask,
+        upBidSize: up.bidSize,
+        upAskSize: up.askSize,
+        spread: up.spread,
+        midpoint: (up.bid + up.ask) / 2,
+        lastTradePrice: lastTrades.get(market.tokenIdUp) ?? null,
+        volume24h: null,
       });
-      saved++;
     }
 
-    logger.info(`Fetch: saved ${saved} snapshots for ${markets.length} markets`);
-  }
-
-  async fetchClosingMarketSnapshots(): Promise<void> {
-    logger.debug('Last-minute: checking...');
-    const markets = this.storage.getClosingMarkets(5);
-    if (markets.length === 0) {
-      logger.debug('Last-minute: no markets closing soon');
-      return;
+    if (rows.length > 0) {
+      this.storage.insertSnapshots(rows);
     }
-
-    logger.debug(`Last-minute: checking ${markets.length} markets`);
-    const now = new Date();
-    const fetchedAt = now.toISOString();
-
-    for (const market of markets) {
-      const marketStart = new Date(market.eventStartTime);
-      const minuteOfHour = Math.floor((now.getTime() - marketStart.getTime()) / 60000);
-
-      const [prices, midpoint, spreadData, gm] = await Promise.all([
-        this.polymarket.getPrices([market.tokenIdUp, market.tokenIdDown]),
-        this.polymarket.getMidpoint(market.tokenIdUp),
-        this.polymarket.getSpread(market.tokenIdUp),
-        this.polymarket.getMarketBySlug(market.slug),
-      ]);
-
-      const upPrice = prices.get(market.tokenIdUp) ?? 0;
-      const downPrice = prices.get(market.tokenIdDown) ?? 0;
-
-      this.storage.insertSnapshot({
-        marketId: market.id,
-        fetchedAt,
-        minuteOfHour,
-        upPrice,
-        downPrice,
-        upBid: spreadData?.bid ?? null,
-        upAsk: spreadData?.ask ?? null,
-        spread: spreadData?.spread ?? null,
-        midpoint: midpoint ?? null,
-        lastTradePrice: gm?.lastTradePrice ?? null,
-        volume24h: gm?.volume24hr ?? null,
-      });
-
-      logger.info(`Last-minute: ${market.slug} min=${minuteOfHour} up=${upPrice.toFixed(2)} down=${downPrice.toFixed(2)}`);
-    }
+    logger.debug(`Fetch: saved ${rows.length} snapshots for ${markets.length} markets`);
   }
 
   // === Resolution ===
@@ -180,11 +162,12 @@ export class MarketService {
     logger.info('Resolution: checking...');
     const markets = this.storage.getPendingResolutionMarkets();
     if (markets.length === 0) {
-      logger.info('Resolution: no pending markets');
+      logger.debug('Resolution: no pending markets');
       return;
     }
 
-    logger.info(`Resolution: checking ${markets.length} markets`);
+    logger.debug(`Resolution: checking ${markets.length} markets`);
+    let resolved = 0;
     for (const market of markets) {
       const gm = await this.polymarket.getMarketBySlug(market.slug);
       if (!gm) continue;
@@ -193,18 +176,32 @@ export class MarketService {
         const outcome = this.determineOutcome(gm);
         if (outcome) {
           this.storage.updateMarketOutcome(market.id, outcome);
+          resolved++;
           logger.info(`Resolution: ${market.slug} -> ${outcome}`);
+
+          // Settle any positions on this market. Isolated so a settlement
+          // failure never stops the resolution watcher.
+          try {
+            this.trading?.settleMarket(market, outcome);
+          } catch (err) {
+            logger.error(`Resolution: ${market.slug} settlement error: ${err}`);
+          }
         }
       } else {
-        const minutesSinceEnd = (Date.now() - new Date(market.hourEnd).getTime()) / 60000;
-        logger.info(`Resolution: ${market.slug} pending ${minutesSinceEnd.toFixed(1)}m`);
+        // Windows stay open for a few minutes past their end before settling.
+        const minutesSinceEnd = (Date.now() - new Date(market.windowEnd).getTime()) / 60000;
+        logger.debug(`Resolution: ${market.slug} pending ${minutesSinceEnd.toFixed(1)}m`);
       }
+    }
+
+    if (resolved > 0) {
+      logger.info(`Resolution: resolved ${resolved}/${markets.length} pending market(s)`);
     }
   }
 
   // === Helpers ===
 
-  getActiveMarkets(): HourlyMarket[] {
+  getActiveMarkets(): TrackedMarket[] {
     return this.storage.getActiveMarkets();
   }
 
