@@ -1,6 +1,15 @@
 import Database from 'better-sqlite3';
 import { DB_PATH } from '../config.js';
-import type { HourlyMarket, Snapshot, Asset } from '../models/types.js';
+import type {
+  TrackedMarket,
+  Snapshot,
+  Asset,
+  Trade,
+  TradeSide,
+  TradeStatus,
+  TradingMode,
+} from '../models/types.js';
+import { logger } from '../utils/logger.js';
 
 // v2 schema - Up/Down markets without target_price
 
@@ -14,6 +23,7 @@ interface MarketRow {
   event_start_time: string;
   hour_start: string;
   hour_end: string;
+  duration_minutes: number | null;
   outcome: string | null;
   slug: string;
   series_slug: string;
@@ -26,14 +36,36 @@ interface SnapshotRow {
   market_id: string;
   fetched_at: string;
   minute_of_hour: number;
+  second_of_window: number | null;
   up_price: number;
   down_price: number;
   up_bid: number | null;
   up_ask: number | null;
+  up_bid_size: number | null;
+  up_ask_size: number | null;
   spread: number | null;
   midpoint: number | null;
   last_trade_price: number | null;
   volume_24h: number | null;
+}
+
+interface TradeRow {
+  id: string;
+  mode: string;
+  market_id: string;
+  side: string;
+  entry_price: number;
+  spread_at_entry: number;
+  ask_size_at_entry: number;
+  shares: number;
+  stake_usd: number;
+  entered_at: string;
+  order_id: string | null;
+  fill_price: number | null;
+  outcome: string | null;
+  pnl: number | null;
+  settled_at: string | null;
+  status: string;
 }
 
 export class StorageService {
@@ -59,6 +91,7 @@ export class StorageService {
         event_start_time TEXT NOT NULL,
         hour_start TEXT NOT NULL,
         hour_end TEXT NOT NULL,
+        duration_minutes INTEGER,
         outcome TEXT,
         slug TEXT NOT NULL,
         series_slug TEXT NOT NULL,
@@ -71,14 +104,36 @@ export class StorageService {
         market_id TEXT NOT NULL REFERENCES markets(id),
         fetched_at TEXT NOT NULL,
         minute_of_hour INTEGER NOT NULL,
+        second_of_window INTEGER,
         up_price REAL NOT NULL,
         down_price REAL NOT NULL,
         up_bid REAL,
         up_ask REAL,
+        up_bid_size REAL,
+        up_ask_size REAL,
         spread REAL,
         midpoint REAL,
         last_trade_price REAL,
         volume_24h REAL
+      );
+
+      CREATE TABLE IF NOT EXISTS trades (
+        id TEXT PRIMARY KEY,
+        mode TEXT NOT NULL,
+        market_id TEXT NOT NULL REFERENCES markets(id),
+        side TEXT NOT NULL,
+        entry_price REAL NOT NULL,
+        spread_at_entry REAL NOT NULL,
+        ask_size_at_entry REAL NOT NULL,
+        shares REAL NOT NULL,
+        stake_usd REAL NOT NULL,
+        entered_at TEXT NOT NULL,
+        order_id TEXT,
+        fill_price REAL,
+        outcome TEXT,
+        pnl REAL,
+        settled_at TEXT,
+        status TEXT NOT NULL
       );
 
       CREATE INDEX IF NOT EXISTS idx_snapshots_market_id ON snapshots(market_id);
@@ -86,7 +141,35 @@ export class StorageService {
       CREATE INDEX IF NOT EXISTS idx_snapshots_fetched ON snapshots(fetched_at);
       CREATE INDEX IF NOT EXISTS idx_markets_asset ON markets(asset);
       CREATE INDEX IF NOT EXISTS idx_markets_event_start ON markets(event_start_time);
+      CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id);
+      CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
+      CREATE INDEX IF NOT EXISTS idx_trades_entered ON trades(entered_at);
     `);
+
+    this.runMigrations();
+  }
+
+  /**
+   * Additive-only migrations. Existing rows keep their data; new columns are
+   * nullable so historical snapshots stay valid.
+   */
+  private runMigrations(): void {
+    this.addColumnIfMissing('snapshots', 'up_bid_size', 'REAL');
+    this.addColumnIfMissing('snapshots', 'up_ask_size', 'REAL');
+    // Sub-minute precision: a 5-minute market needs seconds, not minutes.
+    this.addColumnIfMissing('snapshots', 'second_of_window', 'INTEGER');
+    // Distinguishes the 5m series from the legacy hourly rows (which are null).
+    this.addColumnIfMissing('markets', 'duration_minutes', 'INTEGER');
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_markets_hour_end ON markets(hour_end)`
+    );
+  }
+
+  private addColumnIfMissing(table: string, column: string, type: string): void {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    if (cols.some((c) => c.name === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    logger.info(`Migration: added ${table}.${column}`);
   }
 
   private stmt(sql: string): Database.Statement {
@@ -98,7 +181,7 @@ export class StorageService {
     return s;
   }
 
-  private rowToMarket(row: MarketRow): HourlyMarket {
+  private rowToMarket(row: MarketRow): TrackedMarket {
     return {
       id: row.id,
       conditionId: row.condition_id,
@@ -107,8 +190,9 @@ export class StorageService {
       asset: row.asset as Asset,
       question: row.question,
       eventStartTime: row.event_start_time,
-      hourStart: row.hour_start,
-      hourEnd: row.hour_end,
+      windowStart: row.hour_start,
+      windowEnd: row.hour_end,
+      durationMinutes: row.duration_minutes,
       outcome: row.outcome as 'UP' | 'DOWN' | null,
       slug: row.slug,
       seriesSlug: row.series_slug,
@@ -123,10 +207,13 @@ export class StorageService {
       marketId: row.market_id,
       fetchedAt: row.fetched_at,
       minuteOfHour: row.minute_of_hour,
+      secondOfWindow: row.second_of_window,
       upPrice: row.up_price,
       downPrice: row.down_price,
       upBid: row.up_bid,
       upAsk: row.up_ask,
+      upBidSize: row.up_bid_size,
+      upAskSize: row.up_ask_size,
       spread: row.spread,
       midpoint: row.midpoint,
       lastTradePrice: row.last_trade_price,
@@ -134,12 +221,13 @@ export class StorageService {
     };
   }
 
-  upsertMarket(market: HourlyMarket): void {
+  upsertMarket(market: TrackedMarket): void {
     const sql = `
       INSERT OR REPLACE INTO markets (
         id, condition_id, token_id_up, token_id_down, asset, question,
-        event_start_time, hour_start, hour_end, outcome, slug, series_slug, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        event_start_time, hour_start, hour_end, duration_minutes, outcome, slug, series_slug,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
     this.stmt(sql).run(
       market.id,
@@ -149,8 +237,9 @@ export class StorageService {
       market.asset,
       market.question,
       market.eventStartTime,
-      market.hourStart,
-      market.hourEnd,
+      market.windowStart,
+      market.windowEnd,
+      market.durationMinutes,
       market.outcome,
       market.slug,
       market.seriesSlug,
@@ -159,48 +248,68 @@ export class StorageService {
     );
   }
 
-  getMarketByConditionId(conditionId: string): HourlyMarket | null {
+  getMarketByConditionId(conditionId: string): TrackedMarket | null {
     const sql = `SELECT * FROM markets WHERE condition_id = ?`;
     const row = this.stmt(sql).get(conditionId) as MarketRow | undefined;
     return row ? this.rowToMarket(row) : null;
   }
 
-  getMarketBySlug(slug: string): HourlyMarket | null {
+  getMarketBySlug(slug: string): TrackedMarket | null {
     const sql = `SELECT * FROM markets WHERE slug = ?`;
     const row = this.stmt(sql).get(slug) as MarketRow | undefined;
     return row ? this.rowToMarket(row) : null;
   }
 
-  getActiveMarkets(): HourlyMarket[] {
-    // Active = currently in hour window (started but not ended)
+  /**
+   * Active = the window has opened and not yet closed.
+   *
+   * Bounded by the stored end time rather than a hardcoded +1 hour, so this
+   * works for any window length.
+   */
+  getActiveMarkets(): TrackedMarket[] {
     const sql = `
       SELECT * FROM markets
       WHERE outcome IS NULL
         AND datetime(event_start_time) <= datetime('now')
-        AND datetime(event_start_time, '+1 hour') > datetime('now')
+        AND datetime(hour_end) > datetime('now')
+      ORDER BY hour_end
     `;
     const rows = this.stmt(sql).all() as MarketRow[];
     return rows.map((r) => this.rowToMarket(r));
   }
 
-  getClosingMarkets(withinMinutes: number = 5): HourlyMarket[] {
+  getClosingMarkets(withinMinutes: number = 5): TrackedMarket[] {
+    return this.getMarketsClosingWithinSeconds(withinMinutes * 60);
+  }
+
+  /** Markets whose window closes within the next `seconds`. */
+  getMarketsClosingWithinSeconds(seconds: number): TrackedMarket[] {
     const sql = `
       SELECT * FROM markets
       WHERE outcome IS NULL
         AND datetime(hour_end) > datetime('now')
-        AND datetime(hour_end) <= datetime('now', '+' || ? || ' minutes')
+        AND datetime(hour_end) <= datetime('now', '+' || ? || ' seconds')
+      ORDER BY hour_end
     `;
-    const rows = this.stmt(sql).all(withinMinutes) as MarketRow[];
+    const rows = this.stmt(sql).all(seconds) as MarketRow[];
     return rows.map((r) => this.rowToMarket(r));
   }
 
-  getPendingResolutionMarkets(): HourlyMarket[] {
+  /**
+   * Closed windows still awaiting an outcome, oldest first.
+   *
+   * Capped: with 5-minute windows across 3 assets these arrive 36x/hour, and a
+   * market that never resolves would otherwise grow this list without bound.
+   */
+  getPendingResolutionMarkets(limit: number = 50): TrackedMarket[] {
     const sql = `
       SELECT * FROM markets
       WHERE outcome IS NULL
         AND datetime(hour_end) <= datetime('now')
+      ORDER BY hour_end
+      LIMIT ?
     `;
-    const rows = this.stmt(sql).all() as MarketRow[];
+    const rows = this.stmt(sql).all(limit) as MarketRow[];
     return rows.map((r) => this.rowToMarket(r));
   }
 
@@ -212,11 +321,11 @@ export class StorageService {
   insertSnapshot(snapshot: Omit<Snapshot, 'id'>): void {
     const sql = `
       INSERT INTO snapshots (
-        market_id, fetched_at, minute_of_hour, up_price, down_price,
-        up_bid, up_ask, spread, midpoint, last_trade_price, volume_24h
+        market_id, fetched_at, minute_of_hour, second_of_window, up_price, down_price,
+        up_bid, up_ask, up_bid_size, up_ask_size, spread, midpoint, last_trade_price, volume_24h
       ) VALUES (
-        @marketId, @fetchedAt, @minuteOfHour, @upPrice, @downPrice,
-        @upBid, @upAsk, @spread, @midpoint, @lastTradePrice, @volume24h
+        @marketId, @fetchedAt, @minuteOfHour, @secondOfWindow, @upPrice, @downPrice,
+        @upBid, @upAsk, @upBidSize, @upAskSize, @spread, @midpoint, @lastTradePrice, @volume24h
       )
     `;
 
@@ -224,10 +333,13 @@ export class StorageService {
       marketId: snapshot.marketId,
       fetchedAt: snapshot.fetchedAt,
       minuteOfHour: snapshot.minuteOfHour,
+      secondOfWindow: snapshot.secondOfWindow ?? null,
       upPrice: snapshot.upPrice || 0,
       downPrice: snapshot.downPrice || 0,
       upBid: snapshot.upBid || null,
       upAsk: snapshot.upAsk || null,
+      upBidSize: snapshot.upBidSize || null,
+      upAskSize: snapshot.upAskSize || null,
       spread: snapshot.spread || null,
       midpoint: snapshot.midpoint || null,
       lastTradePrice: snapshot.lastTradePrice || null,
@@ -235,10 +347,129 @@ export class StorageService {
     });
   }
 
+  /** Insert many snapshots in one transaction - one fsync per tick, not per row. */
+  insertSnapshots(snapshots: Omit<Snapshot, 'id'>[]): void {
+    if (snapshots.length === 0) return;
+    const insertAll = this.db.transaction((batch: Omit<Snapshot, 'id'>[]) => {
+      for (const s of batch) this.insertSnapshot(s);
+    });
+    insertAll(snapshots);
+  }
+
   getSnapshotsByMarket(marketId: string): Snapshot[] {
     const sql = `SELECT * FROM snapshots WHERE market_id = ? ORDER BY fetched_at`;
     const rows = this.stmt(sql).all(marketId) as SnapshotRow[];
     return rows.map((r) => this.rowToSnapshot(r));
+  }
+
+  // === Trades ===
+
+  private rowToTrade(row: TradeRow): Trade {
+    return {
+      id: row.id,
+      mode: row.mode as Exclude<TradingMode, 'off'>,
+      marketId: row.market_id,
+      side: row.side as TradeSide,
+      entryPrice: row.entry_price,
+      spreadAtEntry: row.spread_at_entry,
+      askSizeAtEntry: row.ask_size_at_entry,
+      shares: row.shares,
+      stakeUsd: row.stake_usd,
+      enteredAt: row.entered_at,
+      orderId: row.order_id,
+      fillPrice: row.fill_price,
+      outcome: row.outcome as TradeSide | null,
+      pnl: row.pnl,
+      settledAt: row.settled_at,
+      status: row.status as TradeStatus,
+    };
+  }
+
+  insertTrade(trade: Trade): void {
+    const sql = `
+      INSERT INTO trades (
+        id, mode, market_id, side, entry_price, spread_at_entry, ask_size_at_entry,
+        shares, stake_usd, entered_at, order_id, fill_price, outcome, pnl, settled_at, status
+      ) VALUES (
+        @id, @mode, @marketId, @side, @entryPrice, @spreadAtEntry, @askSizeAtEntry,
+        @shares, @stakeUsd, @enteredAt, @orderId, @fillPrice, @outcome, @pnl, @settledAt, @status
+      )
+    `;
+    this.stmt(sql).run(trade);
+  }
+
+  updateTradeExecution(
+    id: string,
+    fields: { status: TradeStatus; orderId?: string | null; fillPrice?: number | null }
+  ): void {
+    const sql = `
+      UPDATE trades
+      SET status = @status,
+          order_id = COALESCE(@orderId, order_id),
+          fill_price = COALESCE(@fillPrice, fill_price)
+      WHERE id = @id
+    `;
+    this.stmt(sql).run({
+      id,
+      status: fields.status,
+      orderId: fields.orderId ?? null,
+      fillPrice: fields.fillPrice ?? null,
+    });
+  }
+
+  settleTrade(id: string, outcome: TradeSide, pnl: number, settledAt: string): void {
+    const sql = `
+      UPDATE trades
+      SET outcome = ?, pnl = ?, settled_at = ?, status = 'settled'
+      WHERE id = ?
+    `;
+    this.stmt(sql).run(outcome, pnl, settledAt, id);
+  }
+
+  /** Trades still carrying risk (order live or position held) for a market. */
+  getOpenTradesForMarket(marketId: string): Trade[] {
+    const sql = `SELECT * FROM trades WHERE market_id = ? AND status IN ('open', 'filled')`;
+    const rows = this.stmt(sql).all(marketId) as TradeRow[];
+    return rows.map((r) => this.rowToTrade(r));
+  }
+
+  /** Positions held awaiting resolution for a market (paper and live alike). */
+  getUnsettledTradesForMarket(marketId: string): Trade[] {
+    const sql = `SELECT * FROM trades WHERE market_id = ? AND status = 'filled'`;
+    const rows = this.stmt(sql).all(marketId) as TradeRow[];
+    return rows.map((r) => this.rowToTrade(r));
+  }
+
+  /** Count of entries that took (or are taking) risk on the given UTC day. */
+  countTradesOnDay(mode: string, utcDay: string): number {
+    const sql = `
+      SELECT COUNT(*) AS n FROM trades
+      WHERE mode = ? AND date(entered_at) = ? AND status != 'failed'
+    `;
+    const row = this.stmt(sql).get(mode, utcDay) as { n: number };
+    return row.n;
+  }
+
+  /** Realized pnl for trades settled on the given UTC day. */
+  getRealizedPnlOnDay(mode: string, utcDay: string): number {
+    const sql = `
+      SELECT COALESCE(SUM(pnl), 0) AS total FROM trades
+      WHERE mode = ? AND settled_at IS NOT NULL AND date(settled_at) = ?
+    `;
+    const row = this.stmt(sql).get(mode, utcDay) as { total: number };
+    return row.total;
+  }
+
+  getTradesByMode(mode: string): Trade[] {
+    const sql = `SELECT * FROM trades WHERE mode = ? ORDER BY entered_at`;
+    const rows = this.stmt(sql).all(mode) as TradeRow[];
+    return rows.map((r) => this.rowToTrade(r));
+  }
+
+  getModesWithTrades(): string[] {
+    const sql = `SELECT DISTINCT mode FROM trades ORDER BY mode`;
+    const rows = this.stmt(sql).all() as { mode: string }[];
+    return rows.map((r) => r.mode);
   }
 
   close(): void {

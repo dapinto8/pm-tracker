@@ -7,7 +7,9 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "build": "tsc",
+    "test": "tsx --test test/*.test.ts",
     "backfill": "tsx scripts/backfill.ts",
+    "report": "tsx scripts/report.ts",
     "db:reset": "rm -f data/tracker.db && echo 'Database reset'"
   },
   "keywords": [],
@@ -15,6 +17,7 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@ethersproject/wallet": "5.8.0",
     "@polymarket/clob-client": "^5.2.0",
     "better-sqlite3": "^12.6.0",
     "dotenv": "^17.2.3",

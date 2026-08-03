@@ -6,9 +6,9 @@ import {
   MAX_RETRIES,
   RETRY_DELAY_MS,
   ASSET_CONFIG,
-  DISCOVERY_HOURS_AHEAD,
+  DISCOVERY_WINDOWS_AHEAD,
 } from '../config.js';
-import type { GammaMarket, PriceHistoryPoint, Asset } from '../models/types.js';
+import type { GammaMarket, PriceHistoryPoint, Asset, BookTop } from '../models/types.js';
 import { logger } from '../utils/logger.js';
 import { generateUpcomingMarketSlugs } from '../utils/slug.js';
 
@@ -28,6 +28,30 @@ interface OrderBookSummary {
   timestamp: string;
   bids: { price: string; size: string }[];
   asks: { price: string; size: string }[];
+}
+
+/**
+ * Extract best bid/ask and the size resting there.
+ *
+ * The CLOB returns bids sorted ASCENDING by price and asks sorted DESCENDING,
+ * so the best quotes are the LAST elements of each array. Verified empirically
+ * against client.getMidpoint(): (bids[-1] + asks[-1]) / 2 matches the API
+ * midpoint exactly, while (bids[0] + asks[0]) / 2 always yields ~0.50.
+ */
+function bookTopOf(book: OrderBookSummary): BookTop {
+  const bids = book.bids || [];
+  const asks = book.asks || [];
+
+  const bestBidLevel = bids.length > 0 ? bids[bids.length - 1] : null;
+  const bestAskLevel = asks.length > 0 ? asks[asks.length - 1] : null;
+
+  const bid = bestBidLevel ? parseFloat(bestBidLevel.price) : 0;
+  const ask = bestAskLevel ? parseFloat(bestAskLevel.price) : 0;
+  const bidSize = bestBidLevel ? parseFloat(bestBidLevel.size) : 0;
+  const askSize = bestAskLevel ? parseFloat(bestAskLevel.size) : 0;
+  const spread = ask > 0 && bid > 0 ? ask - bid : 0;
+
+  return { bid, ask, bidSize, askSize, spread };
 }
 
 export class PolymarketService {
@@ -95,9 +119,12 @@ export class PolymarketService {
     return result;
   }
 
-  async getMarketsForNextHours(asset: Asset, hoursAhead: number = DISCOVERY_HOURS_AHEAD): Promise<GammaMarket[]> {
+  async getMarketsForNextWindows(
+    asset: Asset,
+    windowsAhead: number = DISCOVERY_WINDOWS_AHEAD
+  ): Promise<GammaMarket[]> {
     const config = ASSET_CONFIG[asset];
-    const slugs = generateUpcomingMarketSlugs(config.slugPrefix, hoursAhead);
+    const slugs = generateUpcomingMarketSlugs(config.slugPrefix, windowsAhead);
     const markets: GammaMarket[] = [];
 
     for (const slug of slugs) {
@@ -122,28 +149,22 @@ export class PolymarketService {
     return result ?? [];
   }
 
-  async getActiveHourlyMarkets(asset: Asset): Promise<GammaMarket[]> {
-    const config = ASSET_CONFIG[asset];
+  /**
+   * Active markets for an asset.
+   *
+   * Slugs are computed directly from the window timestamp, so no search is
+   * needed. Note that the Gamma `series_slug` filter is ignored server-side
+   * (it returns arbitrary unrelated markets), which is why there is no
+   * fallback search here.
+   */
+  async getActiveMarketsForAsset(asset: Asset): Promise<GammaMarket[]> {
     const seen = new Set<string>();
     const markets: GammaMarket[] = [];
 
-    // First try direct slug lookups
-    const directResults = await this.getMarketsForNextHours(asset);
-    for (const m of directResults) {
-      if (!seen.has(m.conditionId)) {
+    for (const m of await this.getMarketsForNextWindows(asset)) {
+      if (!seen.has(m.conditionId) && !m.closed) {
         seen.add(m.conditionId);
         markets.push(m);
-      }
-    }
-
-    // Fall back to series_slug search if few results
-    if (markets.length < 3) {
-      const searchResults = await this.searchMarkets(config.seriesSlug);
-      for (const m of searchResults) {
-        if (!seen.has(m.conditionId) && m.active && !m.closed) {
-          seen.add(m.conditionId);
-          markets.push(m);
-        }
       }
     }
 
@@ -195,29 +216,86 @@ export class PolymarketService {
     return null;
   }
 
-  /**
-   * Get spread for a token.
-   * Note: SDK only returns { spread: string }, not bid/ask.
-   * To get bid/ask, we use getOrderBook instead.
-   */
-  async getSpread(tokenId: string): Promise<{ spread: number; bid: number; ask: number } | null> {
-    // Get order book to extract bid/ask/spread
+  /** Top of book for a single token. See {@link bookTopOf} for the sort-order caveat. */
+  async getBookTop(tokenId: string): Promise<BookTop | null> {
     const result = await this.retry(async () => {
       return this.client.getOrderBook(tokenId) as Promise<OrderBookSummary>;
     }, `getOrderBook(${tokenId})`);
 
     if (result && typeof result === 'object') {
-      const bids = result.bids || [];
-      const asks = result.asks || [];
-
-      // Best bid is highest bid price, best ask is lowest ask price
-      const bestBid = bids.length > 0 ? parseFloat(bids[0].price) : 0;
-      const bestAsk = asks.length > 0 ? parseFloat(asks[0].price) : 0;
-      const spread = bestAsk > 0 && bestBid > 0 ? bestAsk - bestBid : 0;
-
-      return { spread, bid: bestBid, ask: bestAsk };
+      return bookTopOf(result);
     }
     return null;
+  }
+
+  /**
+   * Top of book for many tokens in a SINGLE request.
+   *
+   * This is what makes a 5-second snapshot cadence affordable: one call covers
+   * every tracked token regardless of how many markets are active, instead of
+   * one call per token per tick.
+   */
+  async getBookTops(tokenIds: string[]): Promise<Map<string, BookTop>> {
+    const tops = new Map<string, BookTop>();
+    if (tokenIds.length === 0) return tops;
+
+    const result = await this.retry(async () => {
+      // `side` is required by the SDK's BookParams type but is meaningless for
+      // a book request; the endpoint ignores it.
+      const params = tokenIds.map((token_id) => ({ token_id, side: Side.BUY }));
+      return this.client.getOrderBooks(params) as Promise<OrderBookSummary[]>;
+    }, `getOrderBooks(${tokenIds.length})`);
+
+    if (!Array.isArray(result)) return tops;
+
+    for (const book of result) {
+      // Match on asset_id rather than array position - do not assume the
+      // response preserves request order.
+      if (!book?.asset_id) continue;
+      tops.set(book.asset_id, bookTopOf(book));
+    }
+    return tops;
+  }
+
+  /** Last traded price for many tokens in a single request. */
+  async getLastTradePrices(tokenIds: string[]): Promise<Map<string, number>> {
+    const prices = new Map<string, number>();
+    if (tokenIds.length === 0) return prices;
+
+    const result = await this.retry(async () => {
+      const params = tokenIds.map((token_id) => ({ token_id, side: Side.BUY }));
+      return this.client.getLastTradesPrices(params);
+    }, `getLastTradesPrices(${tokenIds.length})`);
+
+    if (!Array.isArray(result)) return prices;
+
+    for (const entry of result as { token_id?: string; price?: string }[]) {
+      const price = entry?.price ? parseFloat(entry.price) : NaN;
+      if (entry?.token_id && Number.isFinite(price)) {
+        prices.set(entry.token_id, price);
+      }
+    }
+    return prices;
+  }
+
+  /**
+   * Get spread for a token.
+   * Note: SDK only returns { spread: string }, not bid/ask.
+   * To get bid/ask, we use getOrderBook instead.
+   */
+  async getSpread(tokenId: string): Promise<BookTop | null> {
+    return this.getBookTop(tokenId);
+  }
+
+  /**
+   * Taker fee rate in basis points for a token, per the CLOB API.
+   */
+  async getFeeRateBps(tokenId: string): Promise<number | null> {
+    const result = await this.retry(async () => {
+      return this.client.getFeeRateBps(tokenId);
+    }, `getFeeRateBps(${tokenId})`);
+
+    return typeof result === 'number' && Number.isFinite(result) ? result : null;
   }
 
   /**

@@ -1,92 +1,51 @@
-const MONTHS = [
-  'january', 'february', 'march', 'april', 'may', 'june',
-  'july', 'august', 'september', 'october', 'november', 'december',
-];
+import { WINDOW_SECONDS } from '../config.js';
 
-const TZ = 'America/New_York';
+/**
+ * Slugs for the 5-minute up/down series are deterministic:
+ *
+ *   btc-updown-5m-1785774300
+ *                 ^ unix seconds of the window START, aligned to a 300s boundary
+ *
+ * The market and its event share the same slug, so no search endpoint is
+ * needed - every window can be addressed directly by computing its timestamp.
+ *
+ * (The old hourly series used an ET calendar slug like
+ * `bitcoin-up-or-down-august-3-1pm-et`. That format carries no year, so those
+ * slugs now collide with the prior year's markets and always resolve closed.)
+ */
 
-function getETComponents(date: Date): { month: string; day: number; hour: number; ampm: string } {
-  const formatter = new Intl.DateTimeFormat('en-US', {
-    timeZone: TZ,
-    month: 'long',
-    day: 'numeric',
-    hour: 'numeric',
-    hour12: true,
-  });
-
-  const parts = formatter.formatToParts(date);
-  const month = parts.find((p) => p.type === 'month')!.value.toLowerCase();
-  const day = parseInt(parts.find((p) => p.type === 'day')!.value, 10);
-  const hour = parseInt(parts.find((p) => p.type === 'hour')!.value, 10);
-  const ampm = parts.find((p) => p.type === 'dayPeriod')!.value.toLowerCase();
-
-  return { month, day, hour, ampm };
+/** Start of the window containing `date`, as unix seconds. */
+export function windowStartEpoch(date: Date, windowSeconds: number = WINDOW_SECONDS): number {
+  return Math.floor(date.getTime() / 1000 / windowSeconds) * windowSeconds;
 }
 
-export function generateMarketSlug(assetPrefix: string, date: Date): string {
-  const { month, day, hour, ampm } = getETComponents(date);
-  return `${assetPrefix}-${month}-${day}-${hour}${ampm}-et`;
+export function generateMarketSlug(assetPrefix: string, windowEpoch: number): string {
+  return `${assetPrefix}-${windowEpoch}`;
 }
 
-export function generateUpcomingMarketSlugs(assetPrefix: string, hoursAhead: number): string[] {
+/**
+ * Slugs for the current window plus the next `windowsAhead - 1` windows.
+ * Polymarket publishes these many hours in advance.
+ */
+export function generateUpcomingMarketSlugs(
+  assetPrefix: string,
+  windowsAhead: number,
+  now: Date = new Date(),
+  windowSeconds: number = WINDOW_SECONDS
+): string[] {
+  const start = windowStartEpoch(now, windowSeconds);
   const slugs: string[] = [];
-  const now = new Date();
-
-  // Round down to current hour
-  const currentHour = new Date(now);
-  currentHour.setMinutes(0, 0, 0);
-
-  for (let i = 0; i < hoursAhead; i++) {
-    const targetDate = new Date(currentHour.getTime() + i * 60 * 60 * 1000);
-    slugs.push(generateMarketSlug(assetPrefix, targetDate));
+  for (let i = 0; i < windowsAhead; i++) {
+    slugs.push(generateMarketSlug(assetPrefix, start + i * windowSeconds));
   }
-
   return slugs;
 }
 
+/** Window start encoded in a slug, or null if it does not match the format. */
 export function parseSlugDate(slug: string): Date | null {
-  // Pattern: {prefix}-{month}-{day}-{hour}{am/pm}-et
-  const match = slug.match(/^.+-([a-z]+)-(\d+)-(\d+)(am|pm)-et$/);
+  const match = slug.match(/-(\d{9,11})$/);
   if (!match) return null;
-
-  const [, monthStr, dayStr, hourStr, ampm] = match;
-  const monthIndex = MONTHS.indexOf(monthStr);
-  if (monthIndex === -1) return null;
-
-  let hour = parseInt(hourStr, 10);
-  if (ampm === 'pm' && hour !== 12) hour += 12;
-  if (ampm === 'am' && hour === 12) hour = 0;
-
-  const day = parseInt(dayStr, 10);
-
-  // Assume current year, create date in ET then convert to UTC
-  const now = new Date();
-  const year = now.getFullYear();
-
-  // Create a date string and parse in ET timezone
-  const dateStr = `${year}-${String(monthIndex + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}T${String(hour).padStart(2, '0')}:00:00`;
-
-  // Get UTC offset for ET at this date
-  const testDate = new Date(dateStr);
-  const etFormatter = new Intl.DateTimeFormat('en-US', {
-    timeZone: TZ,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  });
-
-  // Parse by creating date in local, then adjusting
-  // Simpler approach: use the offset
-  const utcDate = new Date(
-    Date.UTC(year, monthIndex, day, hour, 0, 0)
-  );
-
-  // Get the offset for ET at this time
-  const etTime = new Date(utcDate.toLocaleString('en-US', { timeZone: TZ }));
-  const offset = utcDate.getTime() - etTime.getTime();
-
-  return new Date(utcDate.getTime() + offset);
+  const epoch = parseInt(match[1], 10);
+  if (!Number.isFinite(epoch)) return null;
+  return new Date(epoch * 1000);
 }
