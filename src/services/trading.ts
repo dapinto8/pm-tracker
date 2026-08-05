@@ -26,7 +26,13 @@ import type {
 } from '../models/types.js';
 import type { PolymarketService } from './polymarket.js';
 import type { StorageService } from './storage.js';
-import { evaluateEntry, settlePnl, type EntryPlan } from './strategy.js';
+import {
+  evaluateEntry,
+  isLossLimitBreached,
+  resolveFill,
+  settlePnl,
+  type EntryPlan,
+} from './strategy.js';
 import { logger } from '../utils/logger.js';
 
 type ActiveMode = Exclude<TradingMode, 'off'>;
@@ -34,7 +40,8 @@ type ActiveMode = Exclude<TradingMode, 'off'>;
 interface LiveFill {
   orderId: string;
   fillPrice: number | null;
-  filled: boolean;
+  /** Shares matched on the exchange. Anything above 0 is a real position. */
+  matchedShares: number;
 }
 
 /**
@@ -49,7 +56,8 @@ interface LiveFill {
  */
 export class TradingService {
   private liveClient: ClobClient | null = null;
-  private feeCheckPassed = false;
+  /** UTC day the fee check last passed on; null until it has ever passed. */
+  private feeCheckDay: string | null = null;
 
   constructor(
     private polymarket: PolymarketService,
@@ -72,11 +80,16 @@ export class TradingService {
     const mode = this.mode;
     const day = utcDay(new Date());
 
+    // Realized pnl alone is not the exposure: several stakes can be in flight
+    // and unsettled, since all three assets close on the same 5-minute
+    // boundaries. Count every open position as a total loss.
     const realized = this.storage.getRealizedPnlOnDay(mode, day);
-    if (realized <= -DAILY_LOSS_LIMIT_USD) {
+    const openExposure = this.storage.getOpenExposure(mode);
+    if (isLossLimitBreached(realized, openExposure, DAILY_LOSS_LIMIT_USD)) {
       logger.error(
         `!!! Trading: DAILY LOSS LIMIT HIT (${mode}) - realized ${realized.toFixed(2)} USD ` +
-        `on ${day} <= -${DAILY_LOSS_LIMIT_USD}. No further trades until tomorrow (UTC). !!!`
+        `on ${day} plus ${openExposure.toFixed(2)} USD at risk in open positions ` +
+        `<= -${DAILY_LOSS_LIMIT_USD}. No further trades until tomorrow (UTC). !!!`
       );
       return;
     }
@@ -194,25 +207,41 @@ export class TradingService {
       return false;
     }
 
-    if (fill.filled) {
+    const outcome = resolveFill(plan, fill.matchedShares, fill.fillPrice);
+
+    if (outcome.status === 'cancelled') {
+      // Nothing matched - pull the order rather than chase the price.
       this.storage.updateTradeExecution(trade.id, {
-        status: 'filled',
+        status: 'cancelled',
         orderId: fill.orderId,
-        fillPrice: fill.fillPrice,
       });
+      logger.warn(
+        `Trading: [live] ${market.slug} not filled in time, order ${fill.orderId} cancelled`
+      );
+      return false;
+    }
+
+    this.storage.updateTradeExecution(trade.id, {
+      status: 'filled',
+      orderId: fill.orderId,
+      fillPrice: fill.fillPrice,
+      shares: outcome.shares,
+      stakeUsd: outcome.stakeUsd,
+    });
+
+    if (outcome.partial) {
+      logger.warn(
+        `Trading: [live] PARTIAL FILL ${market.slug} order=${fill.orderId} - ` +
+        `${outcome.shares} of ${plan.shares} shares @ ${fill.fillPrice ?? plan.entryPrice} ` +
+        `(stake $${outcome.stakeUsd.toFixed(2)} of $${plan.stakeUsd.toFixed(2)}). ` +
+        `Holding the filled portion to resolution.`
+      );
+    } else {
       logger.info(
         `Trading: [live] filled ${market.slug} order=${fill.orderId} price=${fill.fillPrice ?? plan.entryPrice}`
       );
-      return true;
     }
-
-    // Not filled in time - pull the order rather than chase the price.
-    this.storage.updateTradeExecution(trade.id, {
-      status: 'cancelled',
-      orderId: fill.orderId,
-    });
-    logger.warn(`Trading: [live] ${market.slug} not filled in time, order ${fill.orderId} cancelled`);
-    return false;
+    return true;
   }
 
   private async placeAndAwaitFill(
@@ -239,6 +268,9 @@ export class TradingService {
       throw new Error('postOrder returned no order id');
     }
 
+    let matched = 0;
+    let fillPrice: number | null = null;
+
     const deadline = Date.now() + waitMs;
     while (Date.now() < deadline) {
       await sleep(Math.min(ORDER_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
@@ -251,17 +283,18 @@ export class TradingService {
         continue;
       }
 
-      const matched = parseFloat(order?.size_matched ?? '0') || 0;
-      if (matched >= plan.shares) {
-        const price = parseFloat(order?.price ?? '');
-        return {
-          orderId,
-          fillPrice: Number.isFinite(price) ? price : plan.entryPrice,
-          filled: true,
-        };
+      const seen = matchedSharesOf(order);
+      if (seen > matched) {
+        matched = seen;
+        fillPrice = priceOf(order) ?? fillPrice;
       }
-      if (order?.status && ['CANCELED', 'CANCELLED', 'EXPIRED'].includes(order.status.toUpperCase())) {
-        return { orderId, fillPrice: null, filled: false };
+
+      if (matched >= plan.shares) {
+        return { orderId, fillPrice: fillPrice ?? plan.entryPrice, matchedShares: matched };
+      }
+      if (isTerminalStatus(order?.status)) {
+        // Terminal with a partial match is still a real position.
+        return { orderId, fillPrice, matchedShares: matched };
       }
     }
 
@@ -270,16 +303,41 @@ export class TradingService {
     } catch (err) {
       logger.error(`Trading: [live] cancel failed for ${orderId}: ${err}`);
     }
-    return { orderId, fillPrice: null, filled: false };
+
+    // Poll once more AFTER the cancel. A match can land between the last poll
+    // and the cancel taking effect; without this the shares would be held on
+    // the exchange while the trade row said `cancelled`.
+    try {
+      const final = await client.getOrder(orderId);
+      const seen = matchedSharesOf(final);
+      if (seen > matched) {
+        matched = seen;
+        fillPrice = priceOf(final) ?? fillPrice;
+        logger.warn(
+          `Trading: [live] ${orderId} matched ${seen} shares during cancellation`
+        );
+      }
+    } catch (err) {
+      // The order may be gone entirely once cancelled; that is not an error,
+      // but it does mean `matched` is only as fresh as the last good poll.
+      logger.warn(`Trading: [live] post-cancel poll failed for ${orderId}: ${err}`);
+    }
+
+    return { orderId, fillPrice, matchedShares: matched };
   }
 
   /**
    * Taker fees above MAX_FEE_RATE_BPS erase the strategy's ~2.8% edge, so we
-   * refuse to trade rather than bleed. Checked once per process before the
-   * first live order.
+   * refuse to trade rather than bleed.
+   *
+   * Cached per UTC day, not per process: this runs for weeks at a time, and a
+   * fee schedule that changes mid-run would otherwise never be noticed. The
+   * check is also per-token, so re-running it picks up differences between
+   * markets rather than trusting whichever one happened to be checked first.
    */
   private async checkFees(client: ClobClient, tokenId: string): Promise<boolean> {
-    if (this.feeCheckPassed) return true;
+    const today = utcDay(new Date());
+    if (this.feeCheckDay === today) return true;
 
     let feeRateBps: number | null = null;
     try {
@@ -301,8 +359,10 @@ export class TradingService {
       return false;
     }
 
-    logger.info(`Trading: [live] fee check passed (${feeRateBps} bps <= ${MAX_FEE_RATE_BPS})`);
-    this.feeCheckPassed = true;
+    logger.info(
+      `Trading: [live] fee check passed for ${today} (${feeRateBps} bps <= ${MAX_FEE_RATE_BPS})`
+    );
+    this.feeCheckDay = today;
     return true;
   }
 
@@ -339,6 +399,176 @@ export class TradingService {
     } catch (err) {
       logger.error(`Trading: [live] auth failed: ${err}`);
       return null;
+    }
+  }
+
+  // === Reconciliation ===
+
+  /**
+   * Resolve live trades left `open` by a crashed run.
+   *
+   * If the process dies between postOrder and the status update, the row stays
+   * `open` forever while an order - possibly filled - exists on the exchange.
+   * `settleMarket` only settles `filled` rows, so that position is invisible:
+   * never settled, never counted, silently diverging from the wallet.
+   *
+   * Run once at startup, before the scheduler. Deliberately cheap when there is
+   * nothing to do: it reads the database first and returns without touching the
+   * network or authenticating unless open live trades actually exist.
+   */
+  async reconcileOpenTrades(): Promise<void> {
+    if (this.mode !== 'live') {
+      logger.debug('Reconcile: mode is not live, nothing to reconcile');
+      return;
+    }
+
+    const open = this.storage.getOpenLiveTrades();
+    if (open.length === 0) {
+      logger.info('Reconcile: no open live trades');
+      return;
+    }
+
+    logger.warn(
+      `Reconcile: ${open.length} live trade(s) left open by a previous run, resolving...`
+    );
+
+    const counts = { filled: 0, partial: 0, cancelled: 0, failed: 0, unresolved: 0 };
+    const touchedMarkets = new Set<string>();
+
+    // Rows with no order id crashed before postOrder returned, so nothing was
+    // ever confirmed on the exchange. Settle them first - they need no lookup,
+    // and doing them here means a missing key cannot block them.
+    const orphans = open.filter((t) => !t.orderId);
+    for (const trade of orphans) {
+      this.storage.updateTradeExecution(trade.id, { status: 'failed' });
+      logger.warn(`Reconcile: ${trade.id} has no order id, marking failed`);
+      counts.failed += 1;
+    }
+
+    const withOrder = open.filter((t) => t.orderId);
+    if (withOrder.length === 0) {
+      logger.warn(`Reconcile: ${counts.failed} failed (no order was ever placed)`);
+      return;
+    }
+
+    const client = await this.getLiveClient();
+    if (!client) {
+      logger.error('Reconcile: cannot authenticate, leaving open trades untouched');
+      return;
+    }
+
+    for (const trade of withOrder) {
+      try {
+        const result = await this.reconcileTrade(client, trade);
+        counts[result] += 1;
+        if (result === 'filled' || result === 'partial') touchedMarkets.add(trade.marketId);
+      } catch (err) {
+        counts.unresolved += 1;
+        logger.error(`Reconcile: ${trade.id} error: ${err}`);
+      }
+    }
+
+    logger.warn(
+      `Reconcile: ${counts.filled} filled, ${counts.partial} partial, ` +
+      `${counts.cancelled} cancelled, ${counts.failed} failed, ${counts.unresolved} unresolved`
+    );
+
+    // A market may have resolved while the process was down, in which case the
+    // resolution watcher already recorded its outcome and will never revisit
+    // it. Settle anything we just promoted to `filled`.
+    for (const marketId of touchedMarkets) {
+      const market = this.storage.getMarketById(marketId);
+      if (!market?.outcome) continue;
+      logger.warn(
+        `Reconcile: ${market.slug} already resolved to ${market.outcome}, settling recovered position`
+      );
+      try {
+        this.settleMarket(market, market.outcome);
+      } catch (err) {
+        logger.error(`Reconcile: ${market.slug} settlement error: ${err}`);
+      }
+    }
+  }
+
+  /** Resolve one orphaned trade against the exchange. */
+  private async reconcileTrade(
+    client: ClobClient,
+    trade: Trade
+  ): Promise<'filled' | 'partial' | 'cancelled' | 'failed' | 'unresolved'> {
+    // Callers filter these out beforehand; this keeps the type narrowed.
+    if (!trade.orderId) {
+      this.storage.updateTradeExecution(trade.id, { status: 'failed' });
+      return 'failed';
+    }
+
+    let order = await this.fetchOrder(client, trade.orderId);
+
+    // Still resting on the book - it is stale, from a run that is long gone.
+    // Pull it, then judge by whatever it managed to match.
+    if (order && isWorkingStatus(order.status)) {
+      logger.warn(`Reconcile: ${trade.id} order ${trade.orderId} still live, cancelling`);
+      try {
+        await client.cancelOrder({ orderID: trade.orderId });
+      } catch (err) {
+        logger.error(`Reconcile: cancel failed for ${trade.orderId}: ${err}`);
+      }
+      order = await this.fetchOrder(client, trade.orderId);
+    }
+
+    const matched = matchedSharesOf(order);
+    const fillPrice = priceOf(order);
+
+    if (matched <= 0) {
+      // Either gone from the exchange or terminal with nothing matched. Both
+      // mean no position was ever taken.
+      this.storage.updateTradeExecution(trade.id, { status: 'cancelled' });
+      logger.info(`Reconcile: ${trade.id} order ${trade.orderId} took no position, cancelled`);
+      return 'cancelled';
+    }
+
+    const plan: EntryPlan = {
+      side: trade.side,
+      entryPrice: trade.entryPrice,
+      spread: trade.spreadAtEntry,
+      askSize: trade.askSizeAtEntry,
+      shares: trade.shares,
+      stakeUsd: trade.stakeUsd,
+    };
+    const outcome = resolveFill(plan, matched, fillPrice);
+
+    this.storage.updateTradeExecution(trade.id, {
+      status: 'filled',
+      fillPrice: fillPrice ?? trade.entryPrice,
+      shares: outcome.shares,
+      stakeUsd: outcome.stakeUsd,
+    });
+    logger.warn(
+      `Reconcile: ${trade.id} recovered ${outcome.partial ? 'PARTIAL ' : ''}position - ` +
+      `${outcome.shares} of ${trade.shares} shares @ ${fillPrice ?? trade.entryPrice}`
+    );
+    return outcome.partial ? 'partial' : 'filled';
+  }
+
+  /**
+   * Look up an order, treating "not found" as null.
+   *
+   * A lookup that fails for any other reason rethrows: guessing `cancelled`
+   * from a network blip would discard a real position, so an unresolved trade
+   * is left `open` for the next startup to retry.
+   */
+  private async fetchOrder(
+    client: ClobClient,
+    orderId: string
+  ): Promise<{ status?: string; size_matched?: string; price?: string } | null> {
+    try {
+      const order = await client.getOrder(orderId);
+      return order ?? null;
+    } catch (err) {
+      if (isNotFound(err)) {
+        logger.info(`Reconcile: order ${orderId} no longer exists on the exchange`);
+        return null;
+      }
+      throw err;
     }
   }
 
@@ -407,6 +637,43 @@ export class TradingService {
 
 function utcDay(date: Date): string {
   return date.toISOString().slice(0, 10);
+}
+
+/** Shares matched on an order, 0 if absent or unparseable. */
+function matchedSharesOf(order: { size_matched?: string } | null | undefined): number {
+  const n = parseFloat(order?.size_matched ?? '');
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** Price on an order, or null if absent or unparseable. */
+function priceOf(order: { price?: string } | null | undefined): number | null {
+  const n = parseFloat(order?.price ?? '');
+  return Number.isFinite(n) ? n : null;
+}
+
+/** An order in one of these states will never match anything further. */
+function isTerminalStatus(status: string | undefined): boolean {
+  if (!status) return false;
+  return ['CANCELED', 'CANCELLED', 'EXPIRED', 'MATCHED', 'FILLED'].includes(
+    status.toUpperCase()
+  );
+}
+
+/**
+ * Whether an error means "this order does not exist" rather than "the lookup
+ * failed". Only the former is safe to treat as a definitive answer.
+ */
+function isNotFound(err: unknown): boolean {
+  const status = (err as { status?: number; response?: { status?: number } })?.status
+    ?? (err as { response?: { status?: number } })?.response?.status;
+  if (status === 404) return true;
+  return /not found|does not exist/i.test(String(err));
+}
+
+/** An order still resting on the book, i.e. able to match. */
+function isWorkingStatus(status: string | undefined): boolean {
+  if (!status) return false;
+  return ['LIVE', 'OPEN', 'DELAYED', 'UNMATCHED'].includes(status.toUpperCase());
 }
 
 function sleep(ms: number): Promise<void> {

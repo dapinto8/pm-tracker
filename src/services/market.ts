@@ -148,8 +148,11 @@ export class MarketService {
         fetchedAt,
         minuteOfHour: Math.floor(elapsedMs / 60000),
         secondOfWindow,
-        // Matches the previous getPrices(side=BUY) semantics: the best bid.
-        // Null when that side has no bid at all.
+        // NOTE FOR BACKTESTS: this column changed meaning between versions.
+        // Legacy hourly rows stored the best ASK here - they came from
+        // getPrices(side=BUY), and the buy-side price is what you pay to buy,
+        // i.e. the ask. Rows from this version store the best BID; the ask is
+        // in up_ask. Null when that side has no bid at all.
         upPrice: up.bid,
         downPrice: down.bid,
         upBid: up.bid,

@@ -116,12 +116,47 @@ best ask is recorded in the `trades` table and settled like a real one.
 you fund through a Polymarket proxy wallet); API credentials are derived via
 `createOrDeriveApiKey()`. Places a **GTC limit buy at the current best ask** —
 never a market order. If the order is not filled within `ORDER_FILL_TIMEOUT_MS`
-(60s) **or the window closes, whichever comes first**, it is cancelled and
-recorded as `cancelled`; the bot does not chase the price. That clamp matters
-here: entering 30s before close means the full 60s timeout would otherwise
-outlive the market. Before the first live order the market's taker fee
-is checked against `MAX_FEE_RATE_BPS` (default 100); above that it logs a
-warning and refuses to trade, because fees that size erase the edge.
+(60s) **or the window closes, whichever comes first**, the remainder is
+cancelled; the bot does not chase the price. That clamp matters here: entering
+30s before close means the full 60s timeout would otherwise outlive the market.
+The taker fee is checked against `MAX_FEE_RATE_BPS` (default 100) once per UTC
+day; above that it logs a warning and refuses to trade, because fees that size
+erase the edge.
+
+**Partial fills are positions.** If the order is only partly matched when the
+timeout hits, the remainder is cancelled and the filled portion is recorded as
+`filled` with `shares` and `stake_usd` set to what actually matched — then held
+to resolution like any other position. The order is polled once more *after* the
+cancel, because a match can land in the gap between the last poll and the cancel
+taking effect. Treating a partial as a cancel would leave real shares on the
+exchange that the `trades` table never knew about.
+
+### Crash recovery
+
+If the process dies between placing an order and recording its outcome, the row
+stays `open` while an order — possibly filled — still exists on the exchange.
+Settlement only touches `filled` rows, so that position would be invisible
+forever: never settled, never counted.
+
+On startup, before the scheduler runs, `reconcileOpenTrades()` resolves every
+`open` live trade against the exchange:
+
+| Exchange state | Recorded as |
+| --- | --- |
+| Matched in full | `filled` |
+| Partially matched | `filled`, sized to what matched |
+| Terminal with nothing matched, or order gone | `cancelled` |
+| Still resting on the book | cancelled (it is stale), then judged on its final state |
+| No order id — crashed before the order was placed | `failed` |
+
+A lookup that fails for any reason *other* than "no such order" leaves the trade
+`open` for the next startup to retry: guessing `cancelled` from a network blip
+would silently discard a real position. Markets that resolved while the process
+was down are settled immediately after reconciliation, since the resolution
+watcher has already passed them by.
+
+This is a no-op — no network, no authentication — unless the mode is `live`
+*and* such trades exist.
 
 ### Risk controls
 
@@ -129,11 +164,18 @@ warning and refuses to trade, because fees that size erase the edge.
 | --- | --- | --- |
 | `KILL_SWITCH` | unset | Any non-empty value refuses all trading, whatever the mode |
 | `STAKE_USD` | `100` | Dollars per trade |
-| `MAX_TRADES_PER_DAY` | `10` | Entries per UTC day |
-| `DAILY_LOSS_LIMIT_USD` | `300` | Realized pnl <= `-limit` for the UTC day halts trading until tomorrow, logged loudly |
-| `MAX_FEE_RATE_BPS` | `100` | Live mode refuses to trade above this taker fee |
+| `MAX_TRADES_PER_DAY` | `10` | Entries per UTC day. Counts only `open`/`filled`/`settled` — an order that never filled took no risk and must not burn the cap |
+| `DAILY_LOSS_LIMIT_USD` | `300` | Halts trading until tomorrow (UTC) when `realized − openExposure <= -limit`, logged loudly |
+| `MAX_FEE_RATE_BPS` | `100` | Live mode refuses to trade above this taker fee, re-checked daily |
 
 Plus: never more than one open trade per market.
+
+The loss limit counts **open exposure**, not just realized pnl. All three assets
+close on the same 5-minute boundaries, so several stakes can be in flight and
+unsettled when the check runs; each is treated as a total loss, which is exactly
+what it becomes if the market resolves against it. Checking realized pnl alone
+would let the day's worst case overshoot the limit by the whole in-flight
+amount.
 
 Note that `MAX_TRADES_PER_DAY=10` is a much tighter constraint on this series
 than it was hourly — 5-minute windows across 3 assets present 864 opportunities
