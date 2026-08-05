@@ -61,6 +61,26 @@ export interface Snapshot {
   midpoint: number | null;
   lastTradePrice: number | null;
   volume24h: number | null;
+  /**
+   * Where the underlying was trading when this snapshot was taken: the mid of
+   * Binance's best bid/ask, and the moment that quote landed.
+   *
+   * Both are null when the spot request failed. A spot outage must never delay
+   * or drop a book snapshot, so the columns degrade rather than the row.
+   *
+   * `spotFetchedAt` is stamped on arrival of the spot response, NOT at tick
+   * start, and so will differ from `fetchedAt` by tens of milliseconds. That
+   * gap is the book-vs-spot skew; it is recorded rather than assumed away
+   * because fair-value analysis is only as good as the timing it can verify.
+   */
+  spotPrice: number | null;
+  spotFetchedAt: string | null;
+}
+
+/** One asset's underlying spot mid, with the instant it was observed. */
+export interface SpotQuote {
+  mid: number;
+  fetchedAt: string;
 }
 
 /**

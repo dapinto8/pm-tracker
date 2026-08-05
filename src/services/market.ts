@@ -2,6 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { ASSETS, ASSET_CONFIG, DISCOVERY_WINDOWS_AHEAD, WINDOW_MINUTES } from '../config.js';
 import type { TrackedMarket, GammaMarket, Asset, Snapshot, BookTop } from '../models/types.js';
 import type { PolymarketService } from './polymarket.js';
+import type { SpotService } from './spot.js';
 import type { StorageService } from './storage.js';
 import type { TradingService } from './trading.js';
 import { logger } from '../utils/logger.js';
@@ -11,6 +12,7 @@ export class MarketService {
   constructor(
     private polymarket: PolymarketService,
     private storage: StorageService,
+    private spot: SpotService,
     private trading?: TradingService
   ) { }
 
@@ -95,8 +97,13 @@ export class MarketService {
    * Snapshot every active market.
    *
    * Runs on a seconds-level cadence, so it is built around batch endpoints:
-   * exactly TWO upstream calls per tick (order books + last trade prices)
-   * regardless of how many markets are active.
+   * exactly THREE upstream calls per tick (order books, last trade prices, and
+   * Binance spot) regardless of how many markets are active.
+   *
+   * All three are issued CONCURRENTLY. The point of capturing spot at all is to
+   * compare it against the book at the same instant, so anything that widens
+   * the gap between them - fetching in sequence, reusing a stale quote - eats
+   * directly into what the data can support.
    *
    * Deliberately does NOT call Gamma per snapshot. Gamma lags badly at this
    * timescale - observed reporting 0.505/0.50 for a market whose real book was
@@ -111,9 +118,13 @@ export class MarketService {
     }
 
     const tokenIds = markets.flatMap((m) => [m.tokenIdUp, m.tokenIdDown]);
-    const [books, lastTrades] = await Promise.all([
+    // One spot request covers every asset, so this stays three calls per tick
+    // however many markets are active. getSpotMids never throws or retries:
+    // on failure it yields an empty map and the rows record a null spot.
+    const [books, lastTrades, spots] = await Promise.all([
       this.polymarket.getBookTops(tokenIds),
       this.polymarket.getLastTradePrices(tokenIds),
+      this.spot.getSpotMids(),
     ]);
 
     const now = new Date();
@@ -130,6 +141,7 @@ export class MarketService {
 
       const elapsedMs = now.getTime() - new Date(market.eventStartTime).getTime();
       const secondOfWindow = Math.floor(elapsedMs / 1000);
+      const spot = spots.get(market.asset);
 
       // A one-sided book is normal near the close, once the outcome is settled
       // enough that nobody quotes the losing side. Record it as absent rather
@@ -163,6 +175,11 @@ export class MarketService {
         midpoint: up.bid !== null && up.ask !== null ? (up.bid + up.ask) / 2 : null,
         lastTradePrice: lastTrades.get(market.tokenIdUp) ?? null,
         volume24h: null,
+        // Both null together when spot was unavailable this tick. The
+        // timestamp is the spot response's own, not `fetchedAt`, so the skew
+        // between book and spot is recoverable per row.
+        spotPrice: spot?.mid ?? null,
+        spotFetchedAt: spot?.fetchedAt ?? null,
       });
     }
 
