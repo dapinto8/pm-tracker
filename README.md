@@ -51,15 +51,29 @@ new one is skipped and logged.
 `SNAPSHOT_INTERVAL_SECONDS` (default 5) drives the fetch cron. A 5-minute market
 lives for 300s, so the default yields ~60 snapshots per market.
 
-This is affordable because each tick makes exactly **two** upstream calls —
-`getOrderBooks` and `getLastTradesPrices`, both batched over every tracked token
-— regardless of how many markets are active. Measured ~500ms per tick for 3
-markets (6 tokens).
+This is affordable because each tick makes exactly **three** upstream calls —
+`getOrderBooks` and `getLastTradesPrices`, both batched over every tracked
+token, plus one Binance spot request covering all three assets — regardless of
+how many markets are active. Measured ~500ms per tick for 3 markets (6 tokens).
 
 Snapshots deliberately do **not** hit Gamma. At this timescale Gamma lags badly:
 it reported `0.505 / 0.50` for a market whose real CLOB book was `0.27 / 0.28`
 33 seconds into its window. All prices come from the CLOB. The one casualty is
 `volume_24h`, which is Gamma-only and is therefore `null` on 5m rows.
+
+### Underlying spot
+
+Every snapshot also records where the underlying was trading: the mid of
+Binance's best bid/ask (`bookTicker`, public, no key), captured **concurrently**
+with the order book so the two describe the same instant. It is a free stand-in
+for the Chainlink feed these markets actually resolve against, which is gated
+behind Data Streams — close enough for fair-value work, not identical, and the
+difference is why resolution is never inferred from it.
+
+`spot_fetched_at` is stamped when the spot response lands, not at tick start, so
+the book-vs-spot skew is measurable per row rather than assumed to be zero. The
+request is capped at 2s and never retried: on failure both columns go null and
+the book snapshot proceeds untouched. Capturing spot must never cost a snapshot.
 
 ## Trading bot
 
@@ -219,6 +233,8 @@ file and let it be recreated. Nothing is deleted automatically.
 | `snapshots.up_price` / `down_price` | Best bid on each side. Nullable: `null` means that side had no bid. |
 | `snapshots.up_bid` / `up_ask` / `spread` / `midpoint` | All nullable and all honest: `null` means no quote. `spread` and `midpoint` are only written when **both** sides are present (see below). |
 | `snapshots.volume_24h` | Gamma-only, so `null` on 5m rows (see snapshot cadence above). |
+| `snapshots.spot_price` | Binance mid for the underlying. `null` on pre-migration rows and whenever the spot request failed — the two are indistinguishable, and both mean "no spot for this row". |
+| `snapshots.spot_fetched_at` | When that spot quote arrived, to millisecond precision. Differs from `fetched_at` by the book-vs-spot skew. |
 | `trades.status` | `open`, `filled`, `cancelled`, `settled`, `failed`. |
 
 ### Order book ordering

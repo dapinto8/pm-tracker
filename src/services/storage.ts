@@ -37,7 +37,9 @@ const SNAPSHOT_COLUMNS_DDL = `
   spread REAL,
   midpoint REAL,
   last_trade_price REAL,
-  volume_24h REAL
+  volume_24h REAL,
+  spot_price REAL,
+  spot_fetched_at TEXT
 `;
 
 const SNAPSHOT_INDEXES_DDL = `
@@ -80,6 +82,8 @@ interface SnapshotRow {
   midpoint: number | null;
   last_trade_price: number | null;
   volume_24h: number | null;
+  spot_price: number | null;
+  spot_fetched_at: string | null;
 }
 
 interface TradeRow {
@@ -177,6 +181,11 @@ export class StorageService {
     this.addColumnIfMissing('snapshots', 'second_of_window', 'INTEGER');
     // Distinguishes the 5m series from the legacy hourly rows (which are null).
     this.addColumnIfMissing('markets', 'duration_minutes', 'INTEGER');
+    // Underlying spot at snapshot time. Null on every row written before this
+    // existed, and on any row whose spot request failed - the two are
+    // indistinguishable, which is fine: both mean "no spot for this row".
+    this.addColumnIfMissing('snapshots', 'spot_price', 'REAL');
+    this.addColumnIfMissing('snapshots', 'spot_fetched_at', 'TEXT');
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_markets_hour_end ON markets(hour_end)`
     );
@@ -266,6 +275,8 @@ export class StorageService {
       midpoint: row.midpoint,
       lastTradePrice: row.last_trade_price,
       volume24h: row.volume_24h,
+      spotPrice: row.spot_price,
+      spotFetchedAt: row.spot_fetched_at,
     };
   }
 
@@ -376,10 +387,12 @@ export class StorageService {
     const sql = `
       INSERT INTO snapshots (
         market_id, fetched_at, minute_of_hour, second_of_window, up_price, down_price,
-        up_bid, up_ask, up_bid_size, up_ask_size, spread, midpoint, last_trade_price, volume_24h
+        up_bid, up_ask, up_bid_size, up_ask_size, spread, midpoint, last_trade_price, volume_24h,
+        spot_price, spot_fetched_at
       ) VALUES (
         @marketId, @fetchedAt, @minuteOfHour, @secondOfWindow, @upPrice, @downPrice,
-        @upBid, @upAsk, @upBidSize, @upAskSize, @spread, @midpoint, @lastTradePrice, @volume24h
+        @upBid, @upAsk, @upBidSize, @upAskSize, @spread, @midpoint, @lastTradePrice, @volume24h,
+        @spotPrice, @spotFetchedAt
       )
     `;
 
@@ -402,6 +415,8 @@ export class StorageService {
       midpoint: snapshot.midpoint ?? null,
       lastTradePrice: snapshot.lastTradePrice ?? null,
       volume24h: snapshot.volume24h ?? null,
+      spotPrice: snapshot.spotPrice ?? null,
+      spotFetchedAt: snapshot.spotFetchedAt ?? null,
     });
   }
 

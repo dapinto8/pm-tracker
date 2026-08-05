@@ -10,14 +10,16 @@ import {
 import { StorageService } from './services/storage.js';
 import { PolymarketService } from './services/polymarket.js';
 import { MarketService } from './services/market.js';
+import { SpotService } from './services/spot.js';
 import { TradingService } from './services/trading.js';
 import { Scheduler } from './services/scheduler.js';
 import { logger } from './utils/logger.js';
 
 const storage = new StorageService();
 const polymarket = new PolymarketService();
+const spot = new SpotService();
 const trading = new TradingService(polymarket, storage);
-const market = new MarketService(polymarket, storage, trading);
+const market = new MarketService(polymarket, storage, spot, trading);
 const scheduler = new Scheduler(market, trading);
 
 function shutdown(): void {

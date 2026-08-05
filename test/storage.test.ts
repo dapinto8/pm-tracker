@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { StorageService } from '../src/services/storage.js';
-import type { Trade, TrackedMarket } from '../src/models/types.js';
+import type { Trade, TrackedMarket, Snapshot } from '../src/models/types.js';
 
 const DAY = '2026-08-03';
 const AT = (hhmm: string) => `${DAY}T${hhmm}:00.000Z`;
@@ -51,6 +51,28 @@ function trade(over: Partial<Trade> = {}): Trade {
   };
 }
 
+function snapshot(over: Partial<Snapshot> = {}): Omit<Snapshot, 'id'> {
+  return {
+    marketId: 'm1',
+    fetchedAt: AT('12:00'),
+    minuteOfHour: 0,
+    secondOfWindow: 15,
+    upPrice: 0.61,
+    downPrice: 0.38,
+    upBid: 0.61,
+    upAsk: 0.63,
+    upBidSize: 500,
+    upAskSize: 400,
+    spread: 0.02,
+    midpoint: 0.62,
+    lastTradePrice: 0.62,
+    volume24h: null,
+    spotPrice: null,
+    spotFetchedAt: null,
+    ...over,
+  };
+}
+
 /** In-memory database with one market to hang trades off. */
 function freshStorage(): StorageService {
   const s = new StorageService(':memory:');
@@ -59,6 +81,34 @@ function freshStorage(): StorageService {
 }
 
 const close = (a: number, b: number) => Math.abs(a - b) < 1e-9;
+
+// === spot columns ===
+
+test('a snapshot round-trips its spot price and its own spot timestamp', () => {
+  const s = freshStorage();
+  const spotAt = '2026-08-03T12:00:00.187Z';
+  s.insertSnapshot(snapshot({ fetchedAt: AT('12:00'), spotPrice: 113250.2, spotFetchedAt: spotAt }));
+
+  const [stored] = s.getSnapshotsByMarket('m1');
+  assert.equal(stored.spotPrice, 113250.2);
+  // Stored separately from fetchedAt on purpose: the gap between them is the
+  // book-vs-spot skew the fair-value analysis has to be able to measure.
+  assert.equal(stored.spotFetchedAt, spotAt);
+  assert.notEqual(stored.spotFetchedAt, stored.fetchedAt);
+  s.close();
+});
+
+test('a failed spot fetch stores nulls and leaves the book row intact', () => {
+  const s = freshStorage();
+  s.insertSnapshot(snapshot({ spotPrice: null, spotFetchedAt: null }));
+
+  const [stored] = s.getSnapshotsByMarket('m1');
+  assert.equal(stored.spotPrice, null);
+  assert.equal(stored.spotFetchedAt, null);
+  assert.equal(stored.upBid, 0.61, 'the book capture must not be affected');
+  assert.equal(stored.upAsk, 0.63);
+  s.close();
+});
 
 // === countTradesOnDay ===
 

@@ -15,6 +15,7 @@ function envNumber(name: string, fallback: number): number {
 export const GAMMA_API_URL = 'https://gamma-api.polymarket.com';
 export const CLOB_API_URL = 'https://clob.polymarket.com';
 export const CHAIN_ID = 137;
+export const BINANCE_API_URL = 'https://api.binance.com';
 
 // Assets
 export const ASSETS = ['BTC', 'ETH', 'SOL'] as const;
@@ -39,6 +40,29 @@ export const ASSET_CONFIG: Record<Asset, AssetConfig> = {
     slugPrefix: 'sol-updown-5m',
   },
 };
+
+/**
+ * Binance symbol for each tracked asset's underlying.
+ *
+ * Binance is a proxy for the feed these markets actually resolve against
+ * (Chainlink), chosen because it is free and unauthenticated. The public
+ * bookTicker endpoint takes all three symbols in one request, so capturing spot
+ * costs exactly one extra call per snapshot tick regardless of asset count.
+ */
+export const BINANCE_SYMBOLS: Record<Asset, string> = {
+  BTC: 'BTCUSDT',
+  ETH: 'ETHUSDT',
+  SOL: 'SOLUSDT',
+};
+
+/**
+ * Hard ceiling on the spot request.
+ *
+ * Not env-tunable on purpose: this call rides alongside the order book batch in
+ * a 5-second tick, and a timeout anywhere near the tick interval would let a
+ * slow Binance delay the book capture that is the point of the whole service.
+ */
+export const SPOT_TIMEOUT_MS = 2_000;
 
 // Market window
 export const WINDOW_MINUTES = envNumber('WINDOW_MINUTES', 5);
