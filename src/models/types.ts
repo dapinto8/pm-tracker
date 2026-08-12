@@ -1,9 +1,12 @@
-export type Asset = 'BTC' | 'ETH' | 'SOL';
+export type Asset = 'BTC' | 'ETH' | 'SOL' | 'HYPE' | 'DOGE' | 'BNB';
 
 export type SeriesSlug =
   | 'btc-up-or-down-5m'
   | 'eth-up-or-down-5m'
-  | 'sol-up-or-down-5m';
+  | 'sol-up-or-down-5m'
+  | 'hype-up-or-down-5m'
+  | 'doge-up-or-down-5m'
+  | 'bnb-up-or-down-5m';
 
 export interface AssetConfig {
   asset: Asset;
@@ -34,8 +37,40 @@ export interface TrackedMarket {
   outcome: 'UP' | 'DOWN' | null;
   slug: string;
   seriesSlug: string;
+  /**
+   * When this market's trade tape was pulled, or null if it never was.
+   *
+   * Null on every row written before the column existed and on any market whose
+   * tape fetch failed, which is deliberate: it is the only marker of "tape
+   * still owed", and the resolution watcher retries exactly those rows.
+   */
+  tapeFetchedAt: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * One executed trade on a market, as reported by the public data API.
+ *
+ * Captured once per market at resolution so the maker simulation can measure
+ * against real prints instead of inferring fills from book movement.
+ */
+export interface TradeTapeEntry {
+  marketId: string;
+  /** Which token traded, resolved from the print's token id - never from a label. */
+  tokenSide: 'UP' | 'DOWN';
+  price: number;
+  size: number;
+  /** The side the TAKER crossed on. Null when the API omits it. */
+  takerSide: 'BUY' | 'SELL' | null;
+  tradedAt: string;
+  /**
+   * Stable identity for the print, unique-indexed so a re-fetch is a no-op.
+   *
+   * The API returns no trade id of its own, so this is synthesized from the
+   * fields that pin a fill down - see `externalIdOf` in services/tape.ts.
+   */
+  externalId: string;
 }
 
 export interface Snapshot {

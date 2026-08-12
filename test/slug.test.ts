@@ -6,6 +6,7 @@ import {
   parseSlugDate,
   windowStartEpoch,
 } from '../src/utils/slug.js';
+import { ASSETS, ASSET_CONFIG } from '../src/config.js';
 
 // Real market from the live API: btc-updown-5m-1785774300
 // covers 2026-08-03T16:25:00Z -> 2026-08-03T16:30:00Z
@@ -51,6 +52,62 @@ test('rejects slugs without a timestamp suffix', () => {
   // The old hourly format - no epoch, so it must not parse as one.
   assert.equal(parseSlugDate('bitcoin-up-or-down-august-3-1pm-et'), null);
   assert.equal(parseSlugDate('btc-updown-5m'), null);
+});
+
+// === per-asset slugs ===
+
+/**
+ * Live windows read back off the Gamma API on 2026-08-12. Every one of these
+ * resolved to a real market, which is the only thing that makes the prefixes
+ * below trustworthy - the format is a convention upstream, not a contract.
+ */
+const LIVE_SLUGS: Record<string, string> = {
+  BTC: 'btc-updown-5m-1786542600',
+  ETH: 'eth-updown-5m-1786542600',
+  SOL: 'sol-updown-5m-1786542600',
+  HYPE: 'hype-updown-5m-1786542600',
+  DOGE: 'doge-updown-5m-1786542600',
+  BNB: 'bnb-updown-5m-1786542600',
+};
+const LIVE_EPOCH = 1786542600;
+
+test('every tracked asset builds its verified live slug', () => {
+  // Fails loudly if an asset is added to ASSETS without a checked slug, rather
+  // than silently discovering nothing at runtime.
+  assert.deepEqual([...ASSETS].sort(), Object.keys(LIVE_SLUGS).sort());
+
+  for (const asset of ASSETS) {
+    assert.equal(
+      generateMarketSlug(ASSET_CONFIG[asset].slugPrefix, LIVE_EPOCH),
+      LIVE_SLUGS[asset],
+      `${asset} slug`
+    );
+  }
+});
+
+test('the new coins follow the same epoch-suffixed format as BTC', () => {
+  const now = new Date('2026-08-12T13:50:00Z');
+  for (const asset of ['HYPE', 'DOGE', 'BNB'] as const) {
+    const slugs = generateUpcomingMarketSlugs(ASSET_CONFIG[asset].slugPrefix, 3, now);
+    assert.deepEqual(slugs, [
+      `${ASSET_CONFIG[asset].slugPrefix}-1786542600`,
+      `${ASSET_CONFIG[asset].slugPrefix}-1786542900`,
+      `${ASSET_CONFIG[asset].slugPrefix}-1786543200`,
+    ]);
+    // The parser is prefix-agnostic, so a new coin needs no change to it.
+    assert.equal(parseSlugDate(slugs[0])?.toISOString(), '2026-08-12T13:50:00.000Z');
+  }
+});
+
+test('each asset maps to its own series and a distinct prefix', () => {
+  const prefixes = ASSETS.map((a) => ASSET_CONFIG[a].slugPrefix);
+  assert.equal(new Set(prefixes).size, prefixes.length, 'prefixes must not collide');
+
+  for (const asset of ASSETS) {
+    const { seriesSlug, slugPrefix } = ASSET_CONFIG[asset];
+    // Upstream pairs `<coin>-up-or-down-5m` with `<coin>-updown-5m`.
+    assert.equal(seriesSlug, `${slugPrefix.replace('-updown-5m', '')}-up-or-down-5m`);
+  }
 });
 
 test('honours a non-default window length', () => {

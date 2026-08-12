@@ -17,12 +17,19 @@ export const CLOB_API_URL = 'https://clob.polymarket.com';
 export const CHAIN_ID = 137;
 export const BINANCE_API_URL = 'https://api.binance.com';
 
+/** Public data API - the only host that serves executed trades. */
+export const DATA_API_URL = 'https://data-api.polymarket.com';
+
 // Assets
-export const ASSETS = ['BTC', 'ETH', 'SOL'] as const;
+export const ASSETS = ['BTC', 'ETH', 'SOL', 'HYPE', 'DOGE', 'BNB'] as const;
 export type Asset = typeof ASSETS[number];
 
 // Asset configuration for market discovery.
-// These are the 5-minute up/down series, e.g. btc-updown-5m-1785774300.
+//
+// These are the 5-minute up/down series, e.g. btc-updown-5m-1785774300. Every
+// prefix below was verified against the live Gamma API on 2026-08-12: all six
+// series are active and all six follow the same `<coin>-updown-5m-<epoch>`
+// event slug under a `<coin>-up-or-down-5m` series slug, with no exceptions.
 export const ASSET_CONFIG: Record<Asset, AssetConfig> = {
   BTC: {
     asset: 'BTC',
@@ -39,20 +46,50 @@ export const ASSET_CONFIG: Record<Asset, AssetConfig> = {
     seriesSlug: 'sol-up-or-down-5m',
     slugPrefix: 'sol-updown-5m',
   },
+  // Hyperliquid. Titled "Hyperliquid Up or Down" upstream, but the slug uses
+  // the ticker like every other series.
+  HYPE: {
+    asset: 'HYPE',
+    seriesSlug: 'hype-up-or-down-5m',
+    slugPrefix: 'hype-updown-5m',
+  },
+  DOGE: {
+    asset: 'DOGE',
+    seriesSlug: 'doge-up-or-down-5m',
+    slugPrefix: 'doge-updown-5m',
+  },
+  BNB: {
+    asset: 'BNB',
+    seriesSlug: 'bnb-up-or-down-5m',
+    slugPrefix: 'bnb-updown-5m',
+  },
 };
 
 /**
- * Binance symbol for each tracked asset's underlying.
+ * Binance symbol for each tracked asset's underlying, or null where the coin
+ * has no Binance spot listing.
  *
  * Binance is a proxy for the feed these markets actually resolve against
  * (Chainlink), chosen because it is free and unauthenticated. The public
- * bookTicker endpoint takes all three symbols in one request, so capturing spot
+ * bookTicker endpoint takes every symbol in one request, so capturing spot
  * costs exactly one extra call per snapshot tick regardless of asset count.
+ *
+ * Typed as an exhaustive record rather than a partial one so that adding an
+ * asset forces an explicit decision here: a symbol, or null with a reason. A
+ * missing entry would otherwise degrade silently into a permanently null spot
+ * column that nobody notices until the analysis needs it.
  */
-export const BINANCE_SYMBOLS: Record<Asset, string> = {
+export const BINANCE_SYMBOLS: Record<Asset, string | null> = {
   BTC: 'BTCUSDT',
   ETH: 'ETHUSDT',
   SOL: 'SOLUSDT',
+  // Hyperliquid is not listed on Binance spot. Its snapshots carry a null
+  // spot_price by design; a second price source is deliberately NOT added,
+  // because a column whose provenance varies row to row is not usable for the
+  // fair-value work this exists to feed.
+  HYPE: null,
+  DOGE: 'DOGEUSDT',
+  BNB: 'BNBUSDT',
 };
 
 /**
@@ -63,6 +100,42 @@ export const BINANCE_SYMBOLS: Record<Asset, string> = {
  * slow Binance delay the book capture that is the point of the whole service.
  */
 export const SPOT_TIMEOUT_MS = 2_000;
+
+// ============ Trade tape ============
+// Executed trades, pulled once per market after it resolves. This runs on the
+// resolution watcher, never on the snapshot path, so its budget is generous
+// where the spot request's is not.
+
+/**
+ * Page size for GET /trades. The endpoint clamps `limit` at 10,000; 1,000 keeps
+ * each response around 700KB while covering the busiest observed 5m market
+ * (~4,700 prints) in five requests.
+ */
+export const TAPE_PAGE_SIZE = 1_000;
+
+/**
+ * The data API rejects `offset` past 10,000 with a 400 rather than clamping it,
+ * so paging stops here and the tape is recorded as truncated. Reading deeper
+ * would mean windowing on start/end, which no 5m market has ever needed.
+ */
+export const TAPE_MAX_OFFSET = 10_000;
+
+/** Per-page ceiling. Long, because nothing time-critical is waiting on it. */
+export const TAPE_TIMEOUT_MS = 15_000;
+
+/** Markets whose tape is attempted per resolution cycle. */
+export const TAPE_BACKLOG_LIMIT = envNumber('TAPE_BACKLOG_LIMIT', 25);
+
+/**
+ * How far back the backlog will reach for a market still owed a tape.
+ *
+ * This bounds a RETRY queue, not a backfill. Without it, the first run against
+ * an existing database would treat every market ever resolved as owed - 5,373
+ * of them at the time of writing, several million prints - and spend hours
+ * crawling history nobody asked for. Raise it (or set it very large for one
+ * run) to deliberately backfill.
+ */
+export const TAPE_BACKLOG_LOOKBACK_HOURS = envNumber('TAPE_BACKLOG_LOOKBACK_HOURS', 24);
 
 // Market window
 export const WINDOW_MINUTES = envNumber('WINDOW_MINUTES', 5);

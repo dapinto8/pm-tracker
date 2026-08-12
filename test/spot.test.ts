@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseBookTickers, SpotService } from '../src/services/spot.js';
+import { parseBookTickers, SpotService, SPOT_UNLISTED_ASSETS } from '../src/services/spot.js';
+import { BINANCE_SYMBOLS } from '../src/config.js';
 
 const AT = '2026-08-05T16:25:03.412Z';
 
@@ -9,7 +10,12 @@ const PAYLOAD = [
   { symbol: 'BTCUSDT', bidPrice: '113250.10000000', bidQty: '3.21', askPrice: '113250.30000000', askQty: '1.05' },
   { symbol: 'ETHUSDT', bidPrice: '3612.44000000', bidQty: '18.9', askPrice: '3612.56000000', askQty: '22.4' },
   { symbol: 'SOLUSDT', bidPrice: '184.9100000', bidQty: '405', askPrice: '184.9300000', askQty: '311' },
+  { symbol: 'DOGEUSDT', bidPrice: '0.31240000', bidQty: '120000', askPrice: '0.31260000', askQty: '98000' },
+  { symbol: 'BNBUSDT', bidPrice: '842.1100000', bidQty: '31.2', askPrice: '842.1500000', askQty: '18.7' },
 ];
+
+/** Every asset Binance lists for us - HYPE is deliberately absent. */
+const LISTED = 5;
 
 const close = (a: number, b: number) => Math.abs(a - b) < 1e-9;
 
@@ -29,15 +35,17 @@ async function withFetch<T>(stub: typeof fetch, fn: () => Promise<T>): Promise<T
 test('every tracked symbol maps to its asset with the mid of its top of book', () => {
   const mids = parseBookTickers(PAYLOAD, AT);
 
-  assert.equal(mids.size, 3);
+  assert.equal(mids.size, LISTED);
   assert.ok(close(mids.get('BTC')!.mid, (113250.1 + 113250.3) / 2));
   assert.ok(close(mids.get('ETH')!.mid, (3612.44 + 3612.56) / 2));
   assert.ok(close(mids.get('SOL')!.mid, (184.91 + 184.93) / 2));
+  assert.ok(close(mids.get('DOGE')!.mid, (0.3124 + 0.3126) / 2));
+  assert.ok(close(mids.get('BNB')!.mid, (842.11 + 842.15) / 2));
 });
 
 test('the observation timestamp is carried onto every quote', () => {
   const mids = parseBookTickers(PAYLOAD, AT);
-  for (const asset of ['BTC', 'ETH', 'SOL'] as const) {
+  for (const asset of ['BTC', 'ETH', 'SOL', 'DOGE', 'BNB'] as const) {
     assert.equal(mids.get(asset)!.fetchedAt, AT);
   }
 });
@@ -45,10 +53,49 @@ test('the observation timestamp is carried onto every quote', () => {
 test('symbols we do not track are ignored', () => {
   // Guards against a response that echoes more than was asked for.
   const mids = parseBookTickers(
-    [...PAYLOAD, { symbol: 'DOGEUSDT', bidPrice: '0.31', askPrice: '0.32' }],
+    [...PAYLOAD, { symbol: 'XRPUSDT', bidPrice: '2.11', askPrice: '2.12' }],
     AT
   );
-  assert.equal(mids.size, 3);
+  assert.equal(mids.size, LISTED);
+});
+
+// === the HYPE gap ===
+
+test('HYPE is declared unlisted rather than left out of the mapping', () => {
+  // An absent key would read as an oversight and degrade to a permanently null
+  // column; an explicit null is a decision the type system enforces.
+  assert.ok('HYPE' in BINANCE_SYMBOLS);
+  assert.equal(BINANCE_SYMBOLS.HYPE, null);
+  assert.deepEqual([...SPOT_UNLISTED_ASSETS], ['HYPE']);
+});
+
+test('an unlisted asset simply has no quote, and costs the others nothing', () => {
+  const mids = parseBookTickers(PAYLOAD, AT);
+  assert.equal(mids.has('HYPE'), false, 'no substitute source may fill this in');
+  assert.equal(mids.size, LISTED, 'the listed assets are unaffected');
+});
+
+test('an unlisted asset is never asked for', async () => {
+  // The request must not carry a symbol Binance would reject: one bad symbol
+  // fails the whole batch, which would null out spot for every asset.
+  let requested = '';
+  await withFetch(
+    (input) => {
+      requested = String(input);
+      return Promise.resolve(
+        new Response(JSON.stringify(PAYLOAD), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      );
+    },
+    () => new SpotService().getSpotMids()
+  );
+
+  assert.doesNotMatch(requested, /HYPE/);
+  for (const symbol of ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'DOGEUSDT', 'BNBUSDT']) {
+    assert.match(decodeURIComponent(requested), new RegExp(symbol));
+  }
 });
 
 test('a quote that cannot yield an honest mid is dropped, not guessed', () => {
@@ -133,7 +180,7 @@ test('a good response is parsed and stamped with a real timestamp', async () => 
     () => new SpotService().getSpotMids()
   );
 
-  assert.equal(mids.size, 3);
+  assert.equal(mids.size, LISTED);
   const stamped = Date.parse(mids.get('BTC')!.fetchedAt);
   assert.ok(stamped >= before && stamped <= Date.now(), 'stamped when the response landed');
   assert.match(mids.get('BTC')!.fetchedAt, /\.\d{3}Z$/, 'millisecond precision is required');

@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { StorageService } from '../src/services/storage.js';
-import type { Trade, TrackedMarket, Snapshot } from '../src/models/types.js';
+import type { Trade, TrackedMarket, Snapshot, TradeTapeEntry } from '../src/models/types.js';
 
 const DAY = '2026-08-03';
 const AT = (hhmm: string) => `${DAY}T${hhmm}:00.000Z`;
 
-function market(id: string): TrackedMarket {
+function market(id: string, over: Partial<TrackedMarket> = {}): TrackedMarket {
   const now = AT('12:00');
   return {
     id,
@@ -22,8 +22,31 @@ function market(id: string): TrackedMarket {
     outcome: null,
     slug: `slug-${id}`,
     seriesSlug: 'btc-up-or-down-5m',
+    tapeFetchedAt: null,
     createdAt: now,
     updatedAt: now,
+    ...over,
+  };
+}
+
+/** A market that resolved `hoursAgo` ago, so the tape backlog can see it. */
+function resolvedMarket(id: string, hoursAgo: number): TrackedMarket {
+  const end = new Date(Date.now() - hoursAgo * 3600_000).toISOString();
+  return market(id, { outcome: 'UP', windowStart: end, windowEnd: end, eventStartTime: end });
+}
+
+let tapeSeq = 0;
+function tapeEntry(over: Partial<TradeTapeEntry> = {}): TradeTapeEntry {
+  tapeSeq += 1;
+  return {
+    marketId: 'm1',
+    tokenSide: 'UP',
+    price: 0.62,
+    size: 150,
+    takerSide: 'BUY',
+    tradedAt: AT('12:01'),
+    externalId: `0xtx${tapeSeq}:token-up:150:0.62`,
+    ...over,
   };
 }
 
@@ -238,6 +261,135 @@ test('omitted fields are left alone rather than nulled', () => {
   assert.equal(stored.orderId, 'order-3', 'order id must survive');
   assert.equal(stored.shares, 100);
   assert.equal(stored.stakeUsd, 94);
+  s.close();
+});
+
+// === trade tape ===
+
+test('a print round-trips every column it was given', () => {
+  const s = freshStorage();
+  const entry = tapeEntry({ tokenSide: 'DOWN', price: 0.1031460619, size: 158.222221, takerSide: 'SELL' });
+  assert.equal(s.insertTradeTape([entry]), 1);
+
+  assert.deepEqual(s.getTradeTapeByMarket('m1'), [entry]);
+  s.close();
+});
+
+test('a taker side the API did not give is stored as null', () => {
+  const s = freshStorage();
+  s.insertTradeTape([tapeEntry({ takerSide: null })]);
+  assert.equal(s.getTradeTapeByMarket('m1')[0].takerSide, null);
+  s.close();
+});
+
+test('re-inserting the same prints is a no-op', () => {
+  // This is what makes a failed fetch safe to retry: the pages that landed the
+  // first time are re-offered on every attempt and must not duplicate.
+  const s = freshStorage();
+  const page = [tapeEntry(), tapeEntry(), tapeEntry()];
+
+  assert.equal(s.insertTradeTape(page), 3);
+  assert.equal(s.insertTradeTape(page), 0, 'nothing new the second time');
+  assert.equal(s.getTradeTapeByMarket('m1').length, 3);
+  s.close();
+});
+
+test('a retry that overlaps the previous attempt inserts only the new prints', () => {
+  const s = freshStorage();
+  const [a, b, c] = [tapeEntry(), tapeEntry(), tapeEntry()];
+
+  assert.equal(s.insertTradeTape([a, b]), 2);
+  // The retry re-fetches from page zero, so it re-offers a and b alongside c.
+  assert.equal(s.insertTradeTape([a, b, c]), 1);
+  assert.equal(s.getTradeTapeByMarket('m1').length, 3);
+  s.close();
+});
+
+test('two prints that differ only in external id are both kept', () => {
+  const s = freshStorage();
+  const shared = { price: 0.5, size: 100, tradedAt: AT('12:02') };
+  s.insertTradeTape([
+    tapeEntry({ ...shared, externalId: '0xtx:token-up:100:0.5' }),
+    tapeEntry({ ...shared, externalId: '0xtx:token-down:100:0.5' }),
+  ]);
+  assert.equal(s.getTradeTapeByMarket('m1').length, 2);
+  s.close();
+});
+
+test('inserting an empty tape touches nothing', () => {
+  const s = freshStorage();
+  assert.equal(s.insertTradeTape([]), 0);
+  s.close();
+});
+
+// === the tape backlog ===
+
+test('a market is owed a tape once it resolves, and stops being owed once marked', () => {
+  const s = new StorageService(':memory:');
+  s.upsertMarket(resolvedMarket('r1', 1));
+
+  assert.deepEqual(s.getMarketsAwaitingTape().map((m) => m.id), ['r1']);
+  s.markTapeFetched('r1', AT('12:30'));
+  assert.deepEqual(s.getMarketsAwaitingTape(), []);
+  assert.equal(s.getMarketById('r1')?.tapeFetchedAt, AT('12:30'));
+  s.close();
+});
+
+test('an unresolved market is not owed a tape yet', () => {
+  // Its window may still be open, and its prints are not final until it settles.
+  const s = new StorageService(':memory:');
+  s.upsertMarket(market('open1', { outcome: null }));
+  assert.deepEqual(s.getMarketsAwaitingTape(), []);
+  s.close();
+});
+
+test('a market whose fetch failed comes back on the next cycle', () => {
+  // Failure marks nothing, so "resolved with a null marker" is the whole retry
+  // condition - there is no separate retry list to fall out of sync.
+  const s = new StorageService(':memory:');
+  s.upsertMarket(resolvedMarket('r1', 1));
+
+  assert.equal(s.getMarketsAwaitingTape().length, 1);
+  assert.equal(s.getMarketsAwaitingTape().length, 1, 'still owed until it is marked');
+  s.close();
+});
+
+test('the backlog is capped and takes the freshest markets first', () => {
+  // A market that fails forever must not starve the ones resolving behind it.
+  const s = new StorageService(':memory:');
+  for (let i = 0; i < 6; i++) s.upsertMarket(resolvedMarket(`r${i}`, i + 1));
+
+  const batch = s.getMarketsAwaitingTape(3);
+  assert.deepEqual(batch.map((m) => m.id), ['r0', 'r1', 'r2']);
+  s.close();
+});
+
+test('the backlog is a retry queue, not a crawl over all history', () => {
+  // Without the lookback, deploying this against an existing database would
+  // treat thousands of long-settled markets as owed.
+  const s = new StorageService(':memory:');
+  s.upsertMarket(resolvedMarket('recent', 2));
+  s.upsertMarket(resolvedMarket('ancient', 30 * 24));
+
+  assert.deepEqual(s.getMarketsAwaitingTape(50, 24).map((m) => m.id), ['recent']);
+  // Widening the window is how a deliberate backfill is done.
+  assert.equal(s.getMarketsAwaitingTape(50, 365 * 24).length, 2);
+  s.close();
+});
+
+test('re-upserting a market does not wipe its tape marker', () => {
+  // upsertMarket is INSERT OR REPLACE, so a column left off the list would come
+  // back null and the market would be fetched all over again.
+  const s = new StorageService(':memory:');
+  const m = resolvedMarket('r1', 1);
+  s.upsertMarket(m);
+  s.markTapeFetched('r1', AT('12:30'));
+
+  const reloaded = s.getMarketById('r1')!;
+  s.upsertMarket({ ...reloaded, question: 'edited' });
+
+  assert.equal(s.getMarketById('r1')?.tapeFetchedAt, AT('12:30'));
+  assert.deepEqual(s.getMarketsAwaitingTape(), []);
   s.close();
 });
 
