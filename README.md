@@ -1,7 +1,8 @@
 # pm-tracker
 
-Tracks Polymarket's **5-minute** BTC/ETH/SOL up-or-down markets, storing
-high-frequency snapshots in SQLite. Optionally trades them.
+Tracks Polymarket's **5-minute** BTC/ETH/SOL/HYPE/DOGE/BNB up-or-down markets,
+storing high-frequency snapshots and the per-market trade tape in SQLite.
+Optionally trades them.
 
 ## The markets
 
@@ -19,8 +20,25 @@ is needed (which matters, because Gamma's `series_slug` filter is ignored
 server-side and returns unrelated markets). Windows are published several hours
 ahead; outcomes settle a few minutes after the window closes.
 
-Series: `btc-up-or-down-5m`, `eth-up-or-down-5m`, `sol-up-or-down-5m`. (XRP and
-DOGE also exist upstream if you want to add them to `ASSETS`.)
+### Tracked assets
+
+| Asset | Series | Event slug prefix | Binance spot |
+| --- | --- | --- | --- |
+| BTC | `btc-up-or-down-5m` | `btc-updown-5m` | `BTCUSDT` |
+| ETH | `eth-up-or-down-5m` | `eth-updown-5m` | `ETHUSDT` |
+| SOL | `sol-up-or-down-5m` | `sol-updown-5m` | `SOLUSDT` |
+| HYPE | `hype-up-or-down-5m` | `hype-updown-5m` | — none, see below |
+| DOGE | `doge-up-or-down-5m` | `doge-updown-5m` | `DOGEUSDT` |
+| BNB | `bnb-up-or-down-5m` | `bnb-updown-5m` | `BNBUSDT` |
+
+All six series were verified live against Gamma on 2026-08-12: all active, all
+following the same `<coin>-updown-5m-<epoch>` format, no exceptions. HYPE is
+titled "Hyperliquid Up or Down" upstream but slugged by ticker like the rest.
+(XRP also exists upstream if you want to add it to `ASSETS`.)
+
+Doubling the asset count does **not** change the request cadence — the batched
+book and last-trade calls simply carry twice the tokens, so a tick is still
+three upstream calls. It does double snapshot volume, to roughly 104k rows/day.
 
 ## Setup
 
@@ -40,7 +58,7 @@ npm run report     # trading report
 | --- | --- |
 | `*/5 * * * * *` | Snapshot every active market (seconds field — ~60 per window) |
 | `*/5 * * * *` | Discover the next `DISCOVERY_WINDOWS_AHEAD` windows |
-| `*/2 * * * *` | Resolution watcher (also settles trades) |
+| `*/2 * * * *` | Resolution watcher (also settles trades, then pulls trade tapes) |
 | `*/15 * * * * *` | Trading entry cycle, gated on time-to-close (only if enabled) |
 
 A job never overlaps itself: if a tick is still running when the next fires, the
@@ -53,8 +71,9 @@ lives for 300s, so the default yields ~60 snapshots per market.
 
 This is affordable because each tick makes exactly **three** upstream calls —
 `getOrderBooks` and `getLastTradesPrices`, both batched over every tracked
-token, plus one Binance spot request covering all three assets — regardless of
-how many markets are active. Measured ~500ms per tick for 3 markets (6 tokens).
+token, plus one Binance spot request covering every listed asset — regardless
+of how many markets are active. Adding an asset adds tokens to the existing
+batches, not calls. Measured ~500ms per tick for 3 markets (6 tokens).
 
 Snapshots deliberately do **not** hit Gamma. At this timescale Gamma lags badly:
 it reported `0.505 / 0.50` for a market whose real CLOB book was `0.27 / 0.28`
@@ -74,6 +93,99 @@ difference is why resolution is never inferred from it.
 the book-vs-spot skew is measurable per row rather than assumed to be zero. The
 request is capped at 2s and never retried: on failure both columns go null and
 the book snapshot proceeds untouched. Capturing spot must never cost a snapshot.
+
+#### HYPE has no spot
+
+**Hyperliquid is not listed on Binance spot, so every HYPE snapshot carries a
+null `spot_price` and `spot_fetched_at`.** Its order book data is complete; only
+the underlying reference is missing.
+
+No second source is wired up for it, deliberately. `spot_price` is only useful
+to the fair-value work if it means the same thing on every row, and a column
+whose provenance varies by asset does not. `BINANCE_SYMBOLS` therefore maps HYPE
+to an explicit `null` rather than omitting it — the record is exhaustive over
+`Asset`, so adding a coin forces a symbol or a stated reason there is none.
+
+The gap is announced **once at startup**, not per tick: it is permanent and
+known, and repeating it every 5 seconds would bury the transient spot failures
+that actually warrant attention.
+
+```
+[WARN] Spot: no Binance listing for HYPE - their snapshots will carry a null spot_price for every row
+```
+
+## Trade tape
+
+Snapshots record what the book *looked* like. The tape records what actually
+**traded** — needed because a maker simulation run off book movement is
+inferring fills, and inferred fills are the part of a maker backtest most likely
+to be wrong.
+
+When a market resolves, the resolution watcher pulls its complete trade history
+once from the public data API (`GET /trades` on `data-api.polymarket.com`) into
+`trade_tape`. This applies to **every** tracked asset: BTC/ETH/SOL are the
+control group the candidate coins get measured against.
+
+`takerOnly=true`, so there is one row per print. The maker-inclusive view
+repeats a print once per maker it matched against, which would inflate traded
+volume by a large and uneven factor.
+
+**Timing.** This runs on the resolution cron (`*/2 * * * *`), never on the
+snapshot path, and the scheduler already guards each job against overlapping
+itself — so however long a tape takes, book capture continues on its own
+5-second cadence. Nothing here is time-critical: a settled market is immutable,
+so a tape fetched an hour late is identical to one fetched immediately. A busy
+BTC window (~4,700 prints, five pages) measured ~2s end to end.
+
+**The tape is not clipped to the window.** Windows are published hours ahead and
+stay tradeable briefly after they close, so prints land on both sides of it —
+for one sampled BTC market, 89 before the open, 4,541 during, 112 after. Filter
+on `traded_at` if you want only in-window activity.
+
+### Retries and idempotency
+
+`markets.tape_fetched_at` is the whole state machine. Null means "still owed":
+
+- A market that just resolved has never been fetched → owed.
+- A market whose fetch **failed** was never marked → still owed, retried next
+  cycle. Failure marks nothing, so there is no second list to drift out of sync.
+
+Fetching is **all-or-nothing** across pages. A tape that failed half way and was
+recorded as complete is indistinguishable from a quiet market, which is exactly
+the error a fill simulation would swallow and act on — so a failed page discards
+the whole attempt and the next cycle starts from page zero.
+
+That makes re-delivery the normal case, which is what `external_id` is for. The
+API exposes no trade id, so one is synthesized from
+`transactionHash:tokenId:size:price` and unique-indexed; re-offered prints hit
+`INSERT OR IGNORE` and cost nothing. (The hash alone was unique across all 6,353
+sampled prints. The other three fields are folded in because a single
+transaction carrying two fills would otherwise lose one silently.)
+
+Rows that cannot be an honest print — a price outside `[0, 1]`, a non-positive
+size, a token belonging to no side of this market, a missing hash — are dropped
+and **counted**, and the count is logged. A repaired print is not a print.
+
+### Bounds
+
+| Env | Default | Effect |
+| --- | --- | --- |
+| `TAPE_BACKLOG_LIMIT` | `25` | Markets attempted per resolution cycle |
+| `TAPE_BACKLOG_LOOKBACK_HOURS` | `24` | How far back the backlog will reach for a market still owed a tape |
+
+The lookback bounds a **retry queue, not a backfill**. Without it, the first run
+against an existing database would treat every market ever resolved as owed —
+5,373 of them at the time of writing, several million prints — and spend hours
+crawling history nobody asked for. At 25 per 2 minutes the queue drains ~750/h
+against ~72 resolutions/h, so the default has ample headroom for retries.
+
+**To backfill deliberately**, raise `TAPE_BACKLOG_LOOKBACK_HOURS` for a run
+(e.g. `8760` for a year) and let the watcher work through it.
+
+The API rejects `offset` past 10,000 rather than clamping it, so a tape longer
+than ~11,000 prints stops there, is logged as truncated, and is still marked
+fetched — it is a hard ceiling, not a retryable failure. No 5m market observed
+has come close.
 
 ## Trading bot
 
@@ -184,7 +296,7 @@ This is a no-op — no network, no authentication — unless the mode is `live`
 
 Plus: never more than one open trade per market.
 
-The loss limit counts **open exposure**, not just realized pnl. All three assets
+The loss limit counts **open exposure**, not just realized pnl. All six assets
 close on the same 5-minute boundaries, so several stakes can be in flight and
 unsettled when the check runs; each is treated as a total loss, which is exactly
 what it becomes if the market resolves against it. Checking realized pnl alone
@@ -192,8 +304,8 @@ would let the day's worst case overshoot the limit by the whole in-flight
 amount.
 
 Note that `MAX_TRADES_PER_DAY=10` is a much tighter constraint on this series
-than it was hourly — 5-minute windows across 3 assets present 864 opportunities
-a day, so the cap binds almost immediately. That is deliberate.
+than it was hourly — 5-minute windows across 6 assets present 1,728
+opportunities a day, so the cap binds almost immediately. That is deliberate.
 
 ### Settlement
 
@@ -235,7 +347,22 @@ file and let it be recreated. Nothing is deleted automatically.
 | `snapshots.volume_24h` | Gamma-only, so `null` on 5m rows (see snapshot cadence above). |
 | `snapshots.spot_price` | Binance mid for the underlying. `null` on pre-migration rows and whenever the spot request failed — the two are indistinguishable, and both mean "no spot for this row". |
 | `snapshots.spot_fetched_at` | When that spot quote arrived, to millisecond precision. Differs from `fetched_at` by the book-vs-spot skew. |
+| `markets.tape_fetched_at` | When this market's trade tape landed. `null` on pre-migration rows, on unresolved markets, and on any market whose fetch failed — all of which mean "tape still owed". |
 | `trades.status` | `open`, `filled`, `cancelled`, `settled`, `failed`. |
+
+### `trade_tape`
+
+One row per executed print, captured once per market at resolution. Distinct
+from `trades`, which records this bot's own (optional) positions.
+
+| Column | Notes |
+| --- | --- |
+| `market_id` | FK to `markets.id`. |
+| `token_side` | `UP` or `DOWN`, resolved from the print's **token id** — never from the response's `outcome` label. The two agreed on all 6,353 sampled rows, but the id is what the market is defined by and the label is prose. |
+| `price` / `size` | As reported. `price` is a share price in `[0, 1]`; both carry the API's full precision. |
+| `taker_side` | `BUY` or `SELL` from the **taker's** perspective. `null` when the API omits or garbles it — the print is still real. |
+| `traded_at` | ISO instant, converted from the API's unix **seconds**. |
+| `external_id` | Synthesized `transactionHash:tokenId:size:price`, **unique-indexed**. The API has no trade id of its own; this is what makes a re-fetch a no-op. |
 
 ### Order book ordering
 

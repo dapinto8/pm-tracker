@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { DB_PATH } from '../config.js';
+import { DB_PATH, TAPE_BACKLOG_LIMIT, TAPE_BACKLOG_LOOKBACK_HOURS } from '../config.js';
 import type {
   TrackedMarket,
   Snapshot,
@@ -7,6 +7,7 @@ import type {
   Trade,
   TradeSide,
   TradeStatus,
+  TradeTapeEntry,
   TradingMode,
 } from '../models/types.js';
 import { logger } from '../utils/logger.js';
@@ -62,8 +63,20 @@ interface MarketRow {
   outcome: string | null;
   slug: string;
   series_slug: string;
+  tape_fetched_at: string | null;
   created_at: string;
   updated_at: string;
+}
+
+interface TradeTapeRow {
+  id: number;
+  market_id: string;
+  token_side: string;
+  price: number;
+  size: number;
+  taker_side: string | null;
+  traded_at: string;
+  external_id: string;
 }
 
 interface SnapshotRow {
@@ -159,12 +172,30 @@ export class StorageService {
         status TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS trade_tape (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        market_id TEXT NOT NULL REFERENCES markets(id),
+        token_side TEXT NOT NULL,
+        price REAL NOT NULL,
+        size REAL NOT NULL,
+        taker_side TEXT,
+        traded_at TEXT NOT NULL,
+        external_id TEXT NOT NULL
+      );
+
       ${SNAPSHOT_INDEXES_DDL}
       CREATE INDEX IF NOT EXISTS idx_markets_asset ON markets(asset);
       CREATE INDEX IF NOT EXISTS idx_markets_event_start ON markets(event_start_time);
       CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id);
       CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
       CREATE INDEX IF NOT EXISTS idx_trades_entered ON trades(entered_at);
+
+      -- UNIQUE is the whole idempotency mechanism: a tape fetch that fails
+      -- part-way through is retried from page zero, so the pages that did land
+      -- are re-offered every time. INSERT OR IGNORE turns those into no-ops.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_tape_external ON trade_tape(external_id);
+      CREATE INDEX IF NOT EXISTS idx_trade_tape_market ON trade_tape(market_id);
+      CREATE INDEX IF NOT EXISTS idx_trade_tape_traded ON trade_tape(traded_at);
     `);
 
     this.runMigrations();
@@ -186,6 +217,9 @@ export class StorageService {
     // indistinguishable, which is fine: both mean "no spot for this row".
     this.addColumnIfMissing('snapshots', 'spot_price', 'REAL');
     this.addColumnIfMissing('snapshots', 'spot_fetched_at', 'TEXT');
+    // Marks a market whose trade tape has been pulled. Null means "still owed",
+    // which is what the resolution watcher retries on.
+    this.addColumnIfMissing('markets', 'tape_fetched_at', 'TEXT');
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_markets_hour_end ON markets(hour_end)`
     );
@@ -253,6 +287,7 @@ export class StorageService {
       outcome: row.outcome as 'UP' | 'DOWN' | null,
       slug: row.slug,
       seriesSlug: row.series_slug,
+      tapeFetchedAt: row.tape_fetched_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -280,13 +315,19 @@ export class StorageService {
     };
   }
 
+  /**
+   * `tape_fetched_at` is carried explicitly because this is INSERT OR REPLACE:
+   * the old row is deleted outright, so any column left off the list would come
+   * back null. Callers that re-upsert a loaded market keep its tape marker;
+   * discovery, which only ever upserts markets it just found, passes null.
+   */
   upsertMarket(market: TrackedMarket): void {
     const sql = `
       INSERT OR REPLACE INTO markets (
         id, condition_id, token_id_up, token_id_down, asset, question,
         event_start_time, hour_start, hour_end, duration_minutes, outcome, slug, series_slug,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        tape_fetched_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
     this.stmt(sql).run(
       market.id,
@@ -302,6 +343,7 @@ export class StorageService {
       market.outcome,
       market.slug,
       market.seriesSlug,
+      market.tapeFetchedAt,
       market.createdAt,
       market.updatedAt
     );
@@ -433,6 +475,93 @@ export class StorageService {
     const sql = `SELECT * FROM snapshots WHERE market_id = ? ORDER BY fetched_at`;
     const rows = this.stmt(sql).all(marketId) as SnapshotRow[];
     return rows.map((r) => this.rowToSnapshot(r));
+  }
+
+  // === Trade tape ===
+
+  private rowToTapeEntry(row: TradeTapeRow): TradeTapeEntry {
+    return {
+      marketId: row.market_id,
+      tokenSide: row.token_side as 'UP' | 'DOWN',
+      price: row.price,
+      size: row.size,
+      takerSide: row.taker_side as 'BUY' | 'SELL' | null,
+      tradedAt: row.traded_at,
+      externalId: row.external_id,
+    };
+  }
+
+  /**
+   * Store a market's prints, skipping any already held.
+   *
+   * Returns the number of rows that were genuinely new, which is how a re-fetch
+   * proves itself a no-op. OR IGNORE resolves against the unique index on
+   * external_id, so a page delivered twice costs nothing but the write attempt.
+   */
+  insertTradeTape(entries: TradeTapeEntry[]): number {
+    if (entries.length === 0) return 0;
+    const sql = `
+      INSERT OR IGNORE INTO trade_tape (
+        market_id, token_side, price, size, taker_side, traded_at, external_id
+      ) VALUES (
+        @marketId, @tokenSide, @price, @size, @takerSide, @tradedAt, @externalId
+      )
+    `;
+    const insertAll = this.db.transaction((batch: TradeTapeEntry[]) => {
+      let inserted = 0;
+      for (const e of batch) {
+        inserted += this.stmt(sql).run({
+          marketId: e.marketId,
+          tokenSide: e.tokenSide,
+          price: e.price,
+          size: e.size,
+          takerSide: e.takerSide ?? null,
+          tradedAt: e.tradedAt,
+          externalId: e.externalId,
+        }).changes;
+      }
+      return inserted;
+    });
+    return insertAll(entries);
+  }
+
+  markTapeFetched(marketId: string, fetchedAt: string): void {
+    const sql = `UPDATE markets SET tape_fetched_at = ? WHERE id = ?`;
+    this.stmt(sql).run(fetchedAt, marketId);
+  }
+
+  /**
+   * Resolved markets whose tape has never landed, newest first.
+   *
+   * Covers both halves of the retry rule in one query: a market that has just
+   * resolved has never been fetched, and one whose fetch failed was never
+   * marked, so both appear here and neither needs its own code path.
+   *
+   * Newest first so a market that fails repeatedly cannot starve the ones
+   * resolving behind it. The lookback keeps this a retry queue rather than a
+   * crawl over every market the database has ever resolved - see
+   * TAPE_BACKLOG_LOOKBACK_HOURS.
+   */
+  getMarketsAwaitingTape(
+    limit: number = TAPE_BACKLOG_LIMIT,
+    lookbackHours: number = TAPE_BACKLOG_LOOKBACK_HOURS
+  ): TrackedMarket[] {
+    const sql = `
+      SELECT * FROM markets
+      WHERE outcome IS NOT NULL
+        AND tape_fetched_at IS NULL
+        AND datetime(hour_end) >= datetime('now', '-' || ? || ' hours')
+      ORDER BY hour_end DESC
+      LIMIT ?
+    `;
+    const rows = this.stmt(sql).all(lookbackHours, limit) as MarketRow[];
+    return rows.map((r) => this.rowToMarket(r));
+  }
+
+  getTradeTapeByMarket(marketId: string): TradeTapeEntry[] {
+    const sql = `SELECT * FROM trade_tape WHERE market_id = ? ORDER BY traded_at, id`;
+    const rows = this.stmt(sql).all(marketId) as TradeTapeRow[];
+    return rows.map((r) => this.rowToTapeEntry(r));
   }
 
   // === Trades ===

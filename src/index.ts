@@ -10,7 +10,8 @@ import {
 import { StorageService } from './services/storage.js';
 import { PolymarketService } from './services/polymarket.js';
 import { MarketService } from './services/market.js';
-import { SpotService } from './services/spot.js';
+import { SpotService, SPOT_UNLISTED_ASSETS } from './services/spot.js';
+import { TapeService } from './services/tape.js';
 import { TradingService } from './services/trading.js';
 import { Scheduler } from './services/scheduler.js';
 import { logger } from './utils/logger.js';
@@ -18,8 +19,9 @@ import { logger } from './utils/logger.js';
 const storage = new StorageService();
 const polymarket = new PolymarketService();
 const spot = new SpotService();
+const tape = new TapeService();
 const trading = new TradingService(polymarket, storage);
-const market = new MarketService(polymarket, storage, spot, trading);
+const market = new MarketService(polymarket, storage, spot, trading, tape);
 const scheduler = new Scheduler(market, trading);
 
 function shutdown(): void {
@@ -41,6 +43,15 @@ async function main(): Promise<void> {
     `snapshot every ${SNAPSHOT_INTERVAL_SECONDS}s ` +
     `(~${Math.floor((WINDOW_MINUTES * 60) / SNAPSHOT_INTERVAL_SECONDS)} per window)`
   );
+
+  // Said once, here, rather than every tick: the gap is permanent and known, so
+  // repeating it at snapshot cadence would only drown out real spot failures.
+  if (SPOT_UNLISTED_ASSETS.length > 0) {
+    logger.warn(
+      `Spot: no Binance listing for ${SPOT_UNLISTED_ASSETS.join('/')} - ` +
+      `their snapshots will carry a null spot_price for every row`
+    );
+  }
 
   if (KILL_SWITCH) {
     logger.warn('Trading: KILL_SWITCH set - trading disabled regardless of mode');

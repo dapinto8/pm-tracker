@@ -9,13 +9,28 @@ interface BookTickerEntry {
   askPrice?: string;
 }
 
+const SYMBOL_ENTRIES = Object.entries(BINANCE_SYMBOLS) as [Asset, string | null][];
+
 /** Reverse of BINANCE_SYMBOLS, derived so the two can never drift apart. */
 const ASSET_BY_SYMBOL = new Map<string, Asset>(
-  Object.entries(BINANCE_SYMBOLS).map(([asset, symbol]) => [symbol, asset as Asset])
+  SYMBOL_ENTRIES.filter((e): e is [Asset, string] => e[1] !== null).map(
+    ([asset, symbol]) => [symbol, asset]
+  )
 );
 
+/**
+ * Assets with no Binance spot listing, whose `spot_price` is null on every row.
+ *
+ * Surfaced once at startup rather than warned about per tick: at a 5-second
+ * cadence a known, permanent gap would otherwise emit ~17k identical warnings a
+ * day and bury the transient failures that actually need attention.
+ */
+export const SPOT_UNLISTED_ASSETS: readonly Asset[] = SYMBOL_ENTRIES
+  .filter(([, symbol]) => symbol === null)
+  .map(([asset]) => asset);
+
 /** The endpoint takes a JSON array of symbols: symbols=["BTCUSDT",...]. */
-const SYMBOLS_PARAM = JSON.stringify(Object.values(BINANCE_SYMBOLS));
+const SYMBOLS_PARAM = JSON.stringify([...ASSET_BY_SYMBOL.keys()]);
 
 /** parseFloat, but a missing or unparseable value is null rather than NaN. */
 function numOrNull(value: string | undefined): number | null {
@@ -53,11 +68,13 @@ export function parseBookTickers(payload: unknown, fetchedAt: string): Map<Asset
 
 /**
  * Underlying spot prices from Binance's public REST API. No key, no cache, one
- * request covering every tracked asset.
+ * request covering every asset Binance lists.
  *
  * Single-source by design. A fallback provider would quietly change what
  * `spot_price` means from row to row, and a column whose source is ambiguous is
- * not usable for the fair-value analysis this exists to feed.
+ * not usable for the fair-value analysis this exists to feed. That is also why
+ * an unlisted asset (see {@link SPOT_UNLISTED_ASSETS}) simply gets no quote
+ * rather than one from somewhere else.
  */
 export class SpotService {
   /**
